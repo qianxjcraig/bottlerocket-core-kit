@@ -101,20 +101,27 @@ pub fn cryptsetup_resize(volume_name: &str, key_data: &[u8]) -> Result<()> {
 
 /// Return true if the device holds a real filesystem.
 ///
-/// Probes filesystem superblocks only (`blkid -p -u filesystem`), so
-/// partition-table signatures are deliberately ignored. This matters because
+/// We must distinguish a filesystem from a partition-table signature. libblkid
+/// reports a filesystem via the `TYPE` field (e.g. `TYPE=xfs`) and a partition
+/// table via `PTTYPE` (e.g. `PTTYPE=atari`). We only care about `TYPE`, because
 /// libblkid can report a false-positive Atari *partition table* on the
-/// pseudorandom bytes of a freshly-encrypted volume; we must not treat that as
-/// "formatted", or we would skip the wipe on exactly the devices that need it.
-/// blkid exits 0 when a filesystem is found, non-zero otherwise.
+/// pseudorandom bytes of a freshly-encrypted volume; treating that as
+/// "formatted" would skip the wipe on exactly the devices that need it.
+///
+/// Note: `blkid`'s exit code cannot be used here — the low-level probe (`-p`)
+/// exits 0 whenever it finds *any* signature, including a `PTTYPE`. So we ask
+/// specifically for the filesystem `TYPE` value and check whether it is present.
 pub fn blkid_has_filesystem(device: &str) -> Result<bool> {
-    let status = Command::new(BLKID)
-        .args(["-p", "-u", "filesystem", device])
-        .stdout(Stdio::null())
+    let output = Command::new(BLKID)
+        .args(["-p", "-s", "TYPE", "-o", "value", device])
         .stderr(Stdio::null())
-        .status()
+        .output()
         .with_whatever_context(|_| format!("failed to run blkid on {}", device))?;
-    Ok(status.success())
+    // Non-empty stdout means a filesystem TYPE was found. A device with only a
+    // partition-table signature (PTTYPE) produces no output here. blkid may
+    // exit non-zero when nothing is found, which is fine — we key off output.
+    let fstype = String::from_utf8_lossy(&output.stdout);
+    Ok(!fstype.trim().is_empty())
 }
 
 /// Force-erase all libblkid signatures from a device.
