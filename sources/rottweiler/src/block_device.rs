@@ -81,12 +81,23 @@ pub fn wipe_if_unformatted(path: PathBuf) -> Result<()> {
         .to_str()
         .with_whatever_context(|| format!("path is not valid UTF-8: '{}'", path.display()))?;
 
-    if system::blkid_has_filesystem(device)? {
+    // DIAGNOSTIC: trace each step to the console so we can see where this fails
+    // during early boot. To be removed before the real PR.
+    eprintln!("rottweiler-wipe: checking device {}", device);
+
+    let has_fs = system::blkid_has_filesystem(device)?;
+    eprintln!("rottweiler-wipe: has_filesystem={}", has_fs);
+
+    if has_fs {
         // A real filesystem is present; leave it untouched.
+        eprintln!("rottweiler-wipe: filesystem present, skipping wipe");
         return Ok(());
     }
 
-    system::wipefs_all_force(device)
+    eprintln!("rottweiler-wipe: no filesystem, running wipefs --all --force");
+    system::wipefs_all_force(device)?;
+    eprintln!("rottweiler-wipe: wipefs completed successfully");
+    Ok(())
 }
 
 /// Extract filename from path as UTF-8 string

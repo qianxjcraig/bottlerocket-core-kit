@@ -18,7 +18,7 @@ Environment=DATA_PARTITION_BLOCK_DEVICE=/dev/disk/by-partlabel/BOTTLEROCKET-DATA
 # partition-table signature, making mkfs.xfs refuse to format and failing the
 # boot. This only wipes when no real filesystem is present, so it never destroys
 # data on reboot.
-ExecStartPre=/usr/bin/rottweiler wipe block-device ${DATA_PARTITION_BLOCK_DEVICE}
+ExecStartPre=-/usr/bin/rottweiler wipe block-device ${DATA_PARTITION_BLOCK_DEVICE}
 
 # Create the filesystem on the partition, if it doesn't exist.
 ExecStart=/usr/lib/systemd/systemd-makefs ${DATA_PARTITION_FILESYSTEM} ${DATA_PARTITION_BLOCK_DEVICE}
