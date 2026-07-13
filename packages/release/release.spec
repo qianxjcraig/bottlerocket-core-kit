@@ -184,6 +184,10 @@ Requires: %{_cross_os}systemd
 Requires: %{_cross_os}util-linux
 Requires: %{_cross_os}xfsprogs
 Requires: %{_cross_os}libkcapi
+# rottweiler is used by prepare-local-fs.service (on all variants) to clear
+# false-positive partition-table signatures before formatting the data volume.
+# It must be present regardless of the encrypted-storage image feature.
+Requires: %{_cross_os}rottweiler
 Requires: (%{name}-fips if %{_cross_os}image-feature(fips))
 Requires: (%{name}-crypt if %{_cross_os}image-feature(encrypted-storage))
 

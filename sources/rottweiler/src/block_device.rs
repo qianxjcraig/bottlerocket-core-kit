@@ -76,28 +76,55 @@ pub fn is_encrypted(path: PathBuf) -> Result<bool> {
 /// making `mkfs.xfs` refuse to format and failing the boot. Force-wiping clears
 /// that signature. The filesystem check ensures we never wipe a device that
 /// already holds data, so this is safe to run on every boot.
+/// DIAGNOSTIC: write a line directly to the kernel ring buffer (/dev/kmsg).
+/// Unlike stdout/stderr (which route through journald and did NOT surface to the
+/// EC2 serial console), /dev/kmsg always appears in `get-console-output`.
+/// To be removed before the real PR.
+fn kmsg(msg: &str) {
+    use std::io::Write;
+    // Prefix "<4>" = KERN_WARNING. Low numeric level ensures the message is
+    // below console_loglevel and therefore printed to the serial console
+    // (captured by `aws ec2 get-console-output`), not just stored in the buffer.
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+        let _ = writeln!(f, "<4>rottweiler-wipe: {}", msg);
+    }
+    // Also print to stderr in case /dev/kmsg is unavailable for any reason.
+    eprintln!("rottweiler-wipe: {}", msg);
+}
+
 pub fn wipe_if_unformatted(path: PathBuf) -> Result<()> {
     let device = path
         .to_str()
         .with_whatever_context(|| format!("path is not valid UTF-8: '{}'", path.display()))?;
 
-    // DIAGNOSTIC: trace each step to the console so we can see where this fails
-    // during early boot. To be removed before the real PR.
-    eprintln!("rottweiler-wipe: checking device {}", device);
+    kmsg(&format!("checking device {}", device));
 
-    let has_fs = system::blkid_has_filesystem(device)?;
-    eprintln!("rottweiler-wipe: has_filesystem={}", has_fs);
+    let has_fs = match system::blkid_has_filesystem(device) {
+        Ok(v) => v,
+        Err(e) => {
+            kmsg(&format!("blkid_has_filesystem ERROR: {}", e));
+            return Err(e);
+        }
+    };
+    kmsg(&format!("has_filesystem={}", has_fs));
 
     if has_fs {
         // A real filesystem is present; leave it untouched.
-        eprintln!("rottweiler-wipe: filesystem present, skipping wipe");
+        kmsg("filesystem present, skipping wipe");
         return Ok(());
     }
 
-    eprintln!("rottweiler-wipe: no filesystem, running wipefs --all --force");
-    system::wipefs_all_force(device)?;
-    eprintln!("rottweiler-wipe: wipefs completed successfully");
-    Ok(())
+    kmsg("no filesystem, running wipefs --all --force");
+    match system::wipefs_all_force(device) {
+        Ok(()) => {
+            kmsg("wipefs completed successfully");
+            Ok(())
+        }
+        Err(e) => {
+            kmsg(&format!("wipefs ERROR: {}", e));
+            Err(e)
+        }
+    }
 }
 
 /// Extract filename from path as UTF-8 string
