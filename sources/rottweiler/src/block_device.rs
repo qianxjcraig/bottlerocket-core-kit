@@ -68,6 +68,27 @@ pub fn is_encrypted(path: PathBuf) -> Result<bool> {
     Ok(false)
 }
 
+/// Clear stale or false-positive libblkid signatures from a block device, but
+/// only when it does not already contain a real filesystem.
+///
+/// This guards against a libblkid false positive: on a freshly-encrypted EBS
+/// volume, pseudorandom bytes can match an Atari partition-table signature,
+/// making `mkfs.xfs` refuse to format and failing the boot. Force-wiping clears
+/// that signature. The filesystem check ensures we never wipe a device that
+/// already holds data, so this is safe to run on every boot.
+pub fn wipe_if_unformatted(path: PathBuf) -> Result<()> {
+    let device = path
+        .to_str()
+        .with_whatever_context(|| format!("path is not valid UTF-8: '{}'", path.display()))?;
+
+    if system::blkid_has_filesystem(device)? {
+        // A real filesystem is present; leave it untouched.
+        return Ok(());
+    }
+
+    system::wipefs_all_force(device)
+}
+
 /// Extract filename from path as UTF-8 string
 fn filename(path: &Path) -> Result<&str> {
     path.file_name()

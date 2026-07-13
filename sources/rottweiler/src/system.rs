@@ -10,6 +10,8 @@ const SYSTEMD_CRYPTSETUP: &str = "/usr/lib/systemd/systemd-cryptsetup";
 const CRYPTSETUP: &str = "/usr/sbin/cryptsetup";
 const APICLIENT: &str = "/usr/bin/apiclient";
 const TPM2_PCREXTEND: &str = "/usr/bin/tpm2_pcrextend";
+const BLKID: &str = "/usr/sbin/blkid";
+const WIPEFS: &str = "/usr/sbin/wipefs";
 
 /// Encrypt data using systemd-creds with TPM2 PCRs
 pub fn systemd_creds_encrypt(name: &str, plaintext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
@@ -94,6 +96,34 @@ pub fn cryptsetup_resize(volume_name: &str, key_data: &[u8]) -> Result<()> {
         &["resize", "--key-file=-", volume_name],
         Some(key_data),
     )?;
+    Ok(())
+}
+
+/// Return true if the device holds a real filesystem.
+///
+/// Probes filesystem superblocks only (`blkid -p -u filesystem`), so
+/// partition-table signatures are deliberately ignored. This matters because
+/// libblkid can report a false-positive Atari *partition table* on the
+/// pseudorandom bytes of a freshly-encrypted volume; we must not treat that as
+/// "formatted", or we would skip the wipe on exactly the devices that need it.
+/// blkid exits 0 when a filesystem is found, non-zero otherwise.
+pub fn blkid_has_filesystem(device: &str) -> Result<bool> {
+    let status = Command::new(BLKID)
+        .args(["-p", "-u", "filesystem", device])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_whatever_context(|_| format!("failed to run blkid on {}", device))?;
+    Ok(status.success())
+}
+
+/// Force-erase all libblkid signatures from a device.
+///
+/// `--force` is required: `wipefs --all` alone refuses to erase a
+/// partition-table signature nested on a non-whole-disk device (e.g. the
+/// BOTTLEROCKET-DATA partition), which is precisely the Atari false-positive case.
+pub fn wipefs_all_force(device: &str) -> Result<()> {
+    execute(WIPEFS, &["--all", "--force", device], None)?;
     Ok(())
 }
 

@@ -22,6 +22,7 @@ interface for encrypting and managing encrypted storage resources including:
 - `detach block-device <path>` - Detach an encrypted block device
 - `resize block-device <path> <key-id>` - Resize a LUKS block device
 - `check block-device <path> encrypted|unencrypted` - Check block device encryption state
+- `wipe block-device <path>` - Clear stale/false-positive signatures if unformatted
 
 #### Directory Operations
 - `encrypt directory <path> <key-id>` - Encrypt a directory using fscrypt

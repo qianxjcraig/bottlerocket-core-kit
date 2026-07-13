@@ -19,6 +19,7 @@ interface for encrypting and managing encrypted storage resources including:
 - `detach block-device <path>` - Detach an encrypted block device
 - `resize block-device <path> <key-id>` - Resize a LUKS block device
 - `check block-device <path> encrypted|unencrypted` - Check block device encryption state
+- `wipe block-device <path>` - Clear stale/false-positive signatures if unformatted
 
 ### Directory Operations
 - `encrypt directory <path> <key-id>` - Encrypt a directory using fscrypt
@@ -61,9 +62,9 @@ fn main() -> Result<()> {
     if args.len() >= 3 {
         let verb = args.get(1).map(|s| s.as_str());
         let resource_pos = match verb {
-            Some("encrypt" | "attach" | "detach" | "resize" | "lock" | "unlock" | "check") => {
-                Some(2)
-            }
+            Some(
+                "encrypt" | "attach" | "detach" | "resize" | "lock" | "unlock" | "check" | "wipe",
+            ) => Some(2),
             _ => None,
         };
         if let Some(pos) = resource_pos
@@ -156,6 +157,9 @@ fn main() -> Result<()> {
             MeasureResource::KernelCommandLine(_) => measure::kernel_command_line(),
             MeasureResource::Pcrphase(cmd) => measure::pcrphase(&cmd.phase.to_string()),
         },
+        Command::Wipe(cmd) => match cmd.resource {
+            WipeResource::BlockDevice(cmd) => block_device::wipe_if_unformatted(cmd.path),
+        },
     }
 }
 
@@ -201,6 +205,7 @@ enum Command {
     Unlock(UnlockCmd),
     Check(CheckCmd),
     Measure(MeasureCmd),
+    Wipe(WipeCmd),
 }
 
 #[derive(FromArgs)]
@@ -437,6 +442,29 @@ struct CheckDirectoryEncryptedCmd {}
 #[argh(subcommand, name = "unencrypted")]
 /// Check if unencrypted
 struct CheckDirectoryUnencryptedCmd {}
+
+#[derive(FromArgs)]
+#[argh(subcommand, name = "wipe")]
+/// Wipe stale/false-positive signatures from a resource if it is unformatted
+struct WipeCmd {
+    #[argh(subcommand)]
+    resource: WipeResource,
+}
+
+#[derive(FromArgs)]
+#[argh(subcommand)]
+enum WipeResource {
+    BlockDevice(WipeBlockDeviceCmd),
+}
+
+#[derive(FromArgs)]
+#[argh(subcommand, name = "block-device")]
+/// Clear stale/false-positive signatures from a block device, but only if it
+/// does not already contain a filesystem
+struct WipeBlockDeviceCmd {
+    #[argh(positional)]
+    path: PathBuf,
+}
 
 #[derive(FromArgs)]
 #[argh(subcommand, name = "measure")]
