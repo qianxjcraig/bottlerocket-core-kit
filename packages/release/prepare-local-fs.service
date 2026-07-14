@@ -13,6 +13,12 @@ Type=oneshot
 EnvironmentFile=/usr/share/bottlerocket/image-features.env
 Environment=DATA_PARTITION_BLOCK_DEVICE=/dev/disk/by-partlabel/BOTTLEROCKET-DATA
 
+# Force-erase any Atari partition-table signature falsely detected on random
+# bytes of a fresh encrypted EBS volume. `--types atari` restricts erasure to
+# Atari signatures only, so this is a safe no-op on volumes holding anything
+# else (xfs, gpt, LUKS, ...). See bottlerocket-os/bottlerocket#4855.
+ExecStartPre=/usr/sbin/wipefs --all --force --types atari ${DATA_PARTITION_BLOCK_DEVICE}
+
 # Create the filesystem on the partition, if it doesn't exist.
 ExecStart=/usr/lib/systemd/systemd-makefs ${DATA_PARTITION_FILESYSTEM} ${DATA_PARTITION_BLOCK_DEVICE}
 
