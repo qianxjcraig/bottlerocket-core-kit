@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Bottlerocket Builder <bottlerocket@amazon.com>
+Date: Mon, 14 Jul 2026 00:00:00 +0000
+Subject: [PATCH] libblkid: keep only supported partition-table probers
+
+Bottlerocket only ever creates and consumes GPT (and, for the protective
+MBR that GPT requires, DOS/pMBR) partition tables. The remaining
+partition-table probers are for legacy formats that never appear on
+Bottlerocket's cloud block devices.
+
+One of them, the Atari prober, has no magic number and identifies a
+partition table purely by loose structural heuristics. On a large,
+freshly-encrypted EBS volume, the pseudorandom bytes that back
+never-written blocks can coincidentally satisfy those heuristics, so
+libblkid reports a phantom "atari" partition table. mkfs.xfs then refuses
+to format the BOTTLEROCKET-DATA partition and the node fails to boot
+(~1/1800 launches on ~1 TB volumes). See:
+  - https://github.com/bottlerocket-os/bottlerocket/issues/4855
+  - https://github.com/util-linux/util-linux/issues/1116
+  - https://github.com/rook/rook/issues/7940
+
+Restrict the partition prober list to the formats Bottlerocket supports
+(gpt, dos, and the GPT-protective pmbr). This eliminates the Atari
+false positive at the source and reduces the attack surface of libblkid
+by dropping unused legacy parsers.
+
+The unused prober .c files are intentionally left in the build (their
+externs stay declared in partitions.h); only the registration array is
+trimmed. This keeps the patch confined to a single source file so it does
+not conflict with Makemodule.am / meson.build on upstream version bumps.
+
+Signed-off-by: Bottlerocket Builder <bottlerocket@amazon.com>
+---
+ libblkid/src/partitions/partitions.c | 10 ----------
+ 1 file changed, 10 deletions(-)
+
+diff --git a/libblkid/src/partitions/partitions.c b/libblkid/src/partitions/partitions.c
+index 1111111..2222222 100644
+--- a/libblkid/src/partitions/partitions.c
++++ b/libblkid/src/partitions/partitions.c
+@@ -124,19 +124,9 @@
+  */
+ static const struct blkid_idinfo *idinfos[] =
+ {
+-	&aix_pt_idinfo,
+-	&sgi_pt_idinfo,
+-	&sun_pt_idinfo,
+ 	&dos_pt_idinfo,
+ 	&gpt_pt_idinfo,
+ 	&pmbr_pt_idinfo,	/* always after GPT */
+-	&mac_pt_idinfo,
+-	&ultrix_pt_idinfo,
+-	&bsd_pt_idinfo,
+-	&unixware_pt_idinfo,
+-	&solaris_x86_pt_idinfo,
+-	&minix_pt_idinfo,
+-	&atari_pt_idinfo
+ };
+
+ /*
+--
+2.49.0

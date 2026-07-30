@@ -12,6 +12,12 @@ Source0: https://www.kernel.org/pub/linux/utils/util-linux/v%{majorminor}/util-l
 Source1: https://www.kernel.org/pub/linux/utils/util-linux/v%{majorminor}/util-linux-%{version}.tar.sign
 Source2: gpgkey-B0C64D14301CC6EFAEDF60E4E4B71D5EEC39C284.asc
 
+# Restrict libblkid's partition-table probers to the formats Bottlerocket
+# supports (gpt/dos/pmbr). Removes legacy probers, notably the magic-less
+# Atari prober that false-positives on the pseudorandom bytes of freshly
+# encrypted EBS volumes. See bottlerocket-os/bottlerocket#4855.
+Patch1: 0001-libblkid-keep-only-supported-partition-probers.patch
+
 BuildRequires: %{_cross_os}glibc-devel
 BuildRequires: %{_cross_os}libacl-devel
 BuildRequires: %{_cross_os}libncurses-devel
