@@ -9,7 +9,7 @@
 %global package_priority_epoch 0
 %global _dwz_low_mem_die_limit 0
 
-Name: %{_cross_os}%{gorepo}-2.2
+Name: %{_cross_os}%{gorepo}-2.3
 Version: %{rpmver}
 Release: 1%{?dist}
 Summary: An industry-standard container runtime
