@@ -87,6 +87,10 @@ Provides: %{name}(optimized-gunzip) = 0:
 %build
 %set_cross_go_flags
 
+# containerd 2.3 requires Go 1.26 (go.mod toolchain directive go1.26.x); select
+# the 1.26 toolchain from the SDK instead of the default.
+export GO_MAJOR="1.26"
+
 export BUILDTAGS="no_btrfs selinux"
 export LD_VERSION="-X github.com/containerd/containerd/v2/version.Version=%{gover}+bottlerocket"
 export LD_REVISION="-X github.com/containerd/containerd/v2/version.Revision=%{gitrev}"
