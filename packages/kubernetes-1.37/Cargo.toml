@@ -1,0 +1,21 @@
+[package]
+# "." is not allowed in crate names, but we want a friendlier name for the
+# directory and spec file, so we override it below.
+name = "kubernetes-1_37"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build = "../build.rs"
+
+[lib]
+path = "../packages.rs"
+
+[package.metadata.build-package]
+package-name = "kubernetes-1.37"
+
+[[package.metadata.build-package.external-files]]
+url = "https://distro.eks.amazonaws.com/kubernetes-1-37/releases/1/artifacts/kubernetes/v1.37.0-rc.0/kubernetes-src.tar.gz"
+sha512 = "a4d7c7cfdd992124c47e0e00e97e5eb131770981cecddc6b8da70b06721de32d4abaff74a3b04e0e34dbfbc251b8471c7db68a37cc430b0e01664b2dc3e41fe5"
+
+[build-dependencies]
+glibc = { path = "../glibc" }
