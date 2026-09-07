@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "kits/bottlerocket-core-kit",
+  "packages/accelerator-node-lifecycle",
   "packages/amazon-ecs-cni-plugins",
   "packages/amazon-ssm-agent",
   "packages/amazon-vpc-cni-plugins",

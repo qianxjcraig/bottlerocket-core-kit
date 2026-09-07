@@ -6,6 +6,8 @@ edition = "2021"
 publish = false
 
 [dependencies]
+argh.workspace = true
+fs2.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 snafu.workspace = true

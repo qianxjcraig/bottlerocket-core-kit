@@ -4,9 +4,11 @@
 //! transaction contract those adapters must follow so a node can resume safely after a process
 //! restart or reboot.
 
+mod locked_store;
 mod state;
 mod store;
 
+pub use locked_store::{LockedJsonFileStore, LockedJsonFileStoreGuard, LockedStoreError};
 pub use state::{
     AcceleratorProfile, LifecycleError, LifecycleState, NextAction, TransitionId,
     TransitionOutcome, TransitionPhase, TransitionResult,
