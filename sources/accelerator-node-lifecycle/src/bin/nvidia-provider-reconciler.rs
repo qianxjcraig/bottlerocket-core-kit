@@ -153,9 +153,7 @@ fn command_failure(action: &str, unit: &str, output: &Output) -> io::Error {
     ))
 }
 
-fn rendered_selection<M: ServiceManager>(
-    service_manager: &mut M,
-) -> io::Result<ProviderSelection> {
+fn rendered_selection<M: ServiceManager>(service_manager: &mut M) -> io::Result<ProviderSelection> {
     let mut selection = ProviderSelection::default();
     for provider in PROVIDERS {
         let selected = provider.is_selected(&service_manager.exec_start(provider.unit())?);
@@ -281,10 +279,7 @@ mod tests {
 
         reconcile(&mut manager).unwrap();
 
-        assert_eq!(
-            manager.active_queries,
-            [KUBELET_UNIT, BOOT_COMPLETION_UNIT]
-        );
+        assert_eq!(manager.active_queries, [KUBELET_UNIT, BOOT_COMPLETION_UNIT]);
         assert!(manager.exec_start_queries.is_empty());
         assert!(manager.stops.is_empty());
         assert!(manager.restarts.is_empty());
@@ -298,10 +293,7 @@ mod tests {
             .insert(BOOT_COMPLETION_UNIT.to_string(), true);
 
         assert!(reconcile(&mut manager).is_err());
-        assert_eq!(
-            manager.active_queries,
-            [KUBELET_UNIT, BOOT_COMPLETION_UNIT]
-        );
+        assert_eq!(manager.active_queries, [KUBELET_UNIT, BOOT_COMPLETION_UNIT]);
         assert!(manager.exec_start_queries.is_empty());
         assert!(manager.stops.is_empty());
         assert!(manager.restarts.is_empty());
@@ -320,8 +312,7 @@ mod tests {
 
     #[test]
     fn device_plugin_mode_starts_only_the_device_plugin() {
-        let mut manager =
-            FakeServiceManager::with_selection(&[NvidiaProvider::DevicePlugin]);
+        let mut manager = FakeServiceManager::with_selection(&[NvidiaProvider::DevicePlugin]);
 
         reconcile(&mut manager).unwrap();
 
@@ -361,10 +352,7 @@ mod tests {
     #[test]
     fn contradictory_provider_selection_is_rejected_before_changes() {
         for selected in [
-            vec![
-                NvidiaProvider::DevicePlugin,
-                NvidiaProvider::DraDriver,
-            ],
+            vec![NvidiaProvider::DevicePlugin, NvidiaProvider::DraDriver],
             vec![NvidiaProvider::MpsControlDaemon],
         ] {
             let mut manager = FakeServiceManager::with_selection(&selected);
@@ -380,9 +368,7 @@ mod tests {
         for provider in PROVIDERS {
             assert!(provider.unit().starts_with("nvidia-"));
             assert!(provider.is_selected(&format!("path={} ;", provider.executable())));
-            assert!(
-                !provider.is_selected(&format!("path={}-unexpected ;", provider.executable()))
-            );
+            assert!(!provider.is_selected(&format!("path={}-unexpected ;", provider.executable())));
         }
     }
 
