@@ -2,7 +2,9 @@
 Description=Watch for durable accelerator lifecycle state changes
 
 [Path]
-PathChanged=/var/lib/accelerator-node-lifecycle/state.json
+# state.json is atomically replaced, so watch the stable notification inode
+# updated after each durable state save.
+PathChanged=/var/lib/accelerator-node-lifecycle/state.json.notify
 Unit=accelerator-node-lifecycle-resume.service
 
 [Install]

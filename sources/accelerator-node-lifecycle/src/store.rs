@@ -1,8 +1,10 @@
 use crate::LifecycleState;
 use serde_json::Error as SerdeJsonError;
 use snafu::{ResultExt, Snafu};
-use std::fs::{self, File};
-use std::io;
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
@@ -10,15 +12,26 @@ use tempfile::NamedTempFile;
 #[derive(Clone, Debug)]
 pub struct JsonFileStore {
     path: PathBuf,
+    notification_path: PathBuf,
 }
 
 impl JsonFileStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        let path = path.into();
+        let mut notification_path = OsString::from(path.as_os_str());
+        notification_path.push(".notify");
+        Self {
+            path,
+            notification_path: PathBuf::from(notification_path),
+        }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn notification_path(&self) -> &Path {
+        &self.notification_path
     }
 
     pub fn load(&self) -> Result<LifecycleState, StoreError> {
@@ -73,8 +86,32 @@ impl JsonFileStore {
                 source: error.error,
             })?;
 
-        File::open(parent)
-            .context(OpenStateDirectorySnafu { path: parent })?
+        let parent_directory =
+            File::open(parent).context(OpenStateDirectorySnafu { path: parent })?;
+        parent_directory
+            .sync_all()
+            .context(SyncStateDirectorySnafu { path: parent })?;
+
+        let mut notification = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&self.notification_path)
+            .context(OpenNotificationSnafu {
+                path: &self.notification_path,
+            })?;
+        notification
+            .write_all(b"\n")
+            .context(WriteNotificationSnafu {
+                path: &self.notification_path,
+            })?;
+        notification
+            .sync_all()
+            .context(SyncNotificationSnafu {
+                path: &self.notification_path,
+            })?;
+        parent_directory
             .sync_all()
             .context(SyncStateDirectorySnafu { path: parent })?;
         Ok(())
@@ -127,12 +164,26 @@ pub enum StoreError {
 
     #[snafu(display("failed to sync state directory '{}': {}", path.display(), source))]
     SyncStateDirectory { path: PathBuf, source: io::Error },
+
+    #[snafu(display("failed to open lifecycle notification '{}': {}", path.display(), source))]
+    OpenNotification { path: PathBuf, source: io::Error },
+
+    #[snafu(display(
+        "failed to write lifecycle notification '{}': {}",
+        path.display(),
+        source
+    ))]
+    WriteNotification { path: PathBuf, source: io::Error },
+
+    #[snafu(display("failed to sync lifecycle notification '{}': {}", path.display(), source))]
+    SyncNotification { path: PathBuf, source: io::Error },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{AcceleratorProfile, NextAction};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use tempfile::TempDir;
 
     const TOKEN: &str = "transition-persisted";
@@ -178,9 +229,21 @@ mod tests {
         let second = LifecycleState::new(Some(AcceleratorProfile::DistributedTraining));
 
         store.save(&first).unwrap();
+        let first_notification = fs::metadata(store.notification_path()).unwrap();
         store.save(&second).unwrap();
+        let second_notification = fs::metadata(store.notification_path()).unwrap();
 
         assert_eq!(store.load().unwrap(), second);
+        assert_eq!(
+            first_notification.ino(),
+            second_notification.ino(),
+            "notification inode must remain stable across atomic state replacement"
+        );
+        assert_eq!(second_notification.len(), 1);
+        assert_eq!(
+            second_notification.permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
