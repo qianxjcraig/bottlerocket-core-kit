@@ -21,6 +21,8 @@ BuildRequires: %{_cross_os}glibc-devel
 %description
 Persists and validates resumable NVIDIA accelerator profile transitions for the
 node-side lifecycle component while keeping cluster operations separately owned.
+It also provides an allowlisted settings helper that restarts NVIDIA resource
+providers only after kubelet is active.
 
 %prep
 %setup -T -c
@@ -33,6 +35,8 @@ node-side lifecycle component while keeping cluster operations separately owned.
 %install
 install -d %{buildroot}%{_cross_bindir}
 install -p -m 0755 %{__cargo_outdir}/accelerator-node-lifecycle %{buildroot}%{_cross_bindir}
+install -p -m 0755 %{__cargo_outdir}/nvidia-provider-reconciler %{buildroot}%{_cross_bindir}
 
 %files
 %{_cross_bindir}/accelerator-node-lifecycle
+%{_cross_bindir}/nvidia-provider-reconciler
