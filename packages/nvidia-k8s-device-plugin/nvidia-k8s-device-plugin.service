@@ -2,7 +2,6 @@
 Description=Start NVIDIA kubernetes device plugin
 After=kubelet.service
 Wants=kubelet.service
-Conflicts=nvidia-dra-driver-gpu.service
 
 [Service]
 # Ensure that the kubelet device plugin socket exists before we start

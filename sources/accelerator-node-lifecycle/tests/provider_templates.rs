@@ -11,6 +11,12 @@ const MIG_TEMPLATE: &str =
 const MPS_TEMPLATE: &str = include_str!(
     "../../../packages/nvidia-k8s-device-plugin/nvidia-mps-control-daemon-exec-start-conf"
 );
+const DEVICE_PLUGIN_UNIT: &str =
+    include_str!("../../../packages/nvidia-k8s-device-plugin/nvidia-k8s-device-plugin.service");
+const MPS_UNIT: &str =
+    include_str!("../../../packages/nvidia-k8s-device-plugin/nvidia-mps-control-daemon.service");
+const DRA_UNIT: &str =
+    include_str!("../../../packages/nvidia-dra-driver-gpu/nvidia-dra-driver-gpu.service");
 
 struct TestImporter {
     settings_resolver: JsonSettingsResolver,
@@ -70,9 +76,12 @@ async fn explicit_device_plugin_mode_selects_only_legacy_provider() {
     let mps = render(MPS_TEMPLATE, settings).await;
 
     assert!(device_plugin.contains("ExecStart=/usr/bin/nvidia-device-plugin"));
+    assert!(device_plugin.contains("Conflicts=nvidia-dra-driver-gpu.service"));
     assert!(!dra.contains("ExecStart=/usr/bin/gpu-kubelet-plugin"));
+    assert!(!dra.contains("Conflicts=nvidia-k8s-device-plugin.service"));
     assert!(mig.contains("device-partitioning-strategy = \"mig\""));
     assert!(mps.contains("MPS and MIG are not supported at the same time"));
+    assert!(mps.contains("Conflicts=nvidia-dra-driver-gpu.service"));
 }
 
 #[tokio::test]
@@ -85,7 +94,11 @@ async fn dra_profiles_select_only_dra_provider() {
         let mps = render(MPS_TEMPLATE, settings).await;
 
         assert!(!device_plugin.contains("ExecStart=/usr/bin/nvidia-device-plugin"));
+        assert!(!device_plugin.contains("Conflicts=nvidia-dra-driver-gpu.service"));
         assert!(dra.contains("ExecStart=/usr/bin/gpu-kubelet-plugin"));
+        assert!(dra.contains(
+            "Conflicts=nvidia-k8s-device-plugin.service nvidia-mps-control-daemon.service"
+        ));
         assert!(mig.trim().is_empty());
         assert!(mps.trim().is_empty());
     }
@@ -99,6 +112,8 @@ async fn disabled_mode_selects_no_provider() {
 
     assert!(!device_plugin.contains("ExecStart=/usr/bin/nvidia-device-plugin"));
     assert!(!dra.contains("ExecStart=/usr/bin/gpu-kubelet-plugin"));
+    assert!(!device_plugin.contains("Conflicts="));
+    assert!(!dra.contains("Conflicts="));
 }
 
 #[tokio::test]
@@ -123,7 +138,12 @@ async fn absent_mode_preserves_legacy_enablement() {
             device_plugin.contains("ExecStart=/usr/bin/nvidia-device-plugin"),
             expect_device_plugin
         );
+        assert_eq!(
+            device_plugin.contains("Conflicts=nvidia-dra-driver-gpu.service"),
+            expect_device_plugin
+        );
         assert!(!dra.contains("ExecStart=/usr/bin/gpu-kubelet-plugin"));
+        assert!(!dra.contains("Conflicts="));
     }
 }
 
@@ -135,4 +155,11 @@ async fn explicit_mode_overrides_contradictory_legacy_setting() {
 
     assert!(!device_plugin.contains("ExecStart=/usr/bin/nvidia-device-plugin"));
     assert!(dra.contains("ExecStart=/usr/bin/gpu-kubelet-plugin"));
+}
+
+#[test]
+fn base_units_do_not_conflict_with_inactive_provider_placeholders() {
+    for unit in [DEVICE_PLUGIN_UNIT, MPS_UNIT, DRA_UNIT] {
+        assert!(!unit.contains("Conflicts="));
+    }
 }

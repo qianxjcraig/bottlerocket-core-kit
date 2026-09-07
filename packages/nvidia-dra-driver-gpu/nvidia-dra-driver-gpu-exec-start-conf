@@ -19,6 +19,10 @@ ExecStart=/usr/bin/true
 Type=oneshot
 RemainAfterExit=true
 {{else}}
+[Unit]
+Conflicts=nvidia-k8s-device-plugin.service nvidia-mps-control-daemon.service
+
+[Service]
 ExecStartPre=/usr/bin/sleep 0.1
 ExecStartPre=/usr/bin/test -d /var/lib/kubelet/plugins_registry
 # NVIDIA DRA GPU kubelet plugin. It registers with the local kubelet, discovers

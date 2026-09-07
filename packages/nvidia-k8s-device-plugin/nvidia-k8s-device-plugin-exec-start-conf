@@ -8,6 +8,10 @@ ExecStartPre=
 ExecStart=
 {{#if_not_null settings.accelerators.nvidia.mode}}
 {{#if (eq settings.accelerators.nvidia.mode "device-plugin")}}
+[Unit]
+Conflicts=nvidia-dra-driver-gpu.service
+
+[Service]
 # Ensure that the kubelet device plugin socket exists before we start
 # A brief sleep is needed to avoid the `test` failing its first check
 ExecStartPre=/usr/bin/sleep 0.1
@@ -23,6 +27,10 @@ RemainAfterExit=true
 {{else}}
 {{#if_not_null settings.kubelet-device-plugins.nvidia}}
 {{#if (eq (default "true" settings.kubelet-device-plugins.nvidia.enabled) "true")}}
+[Unit]
+Conflicts=nvidia-dra-driver-gpu.service
+
+[Service]
 # Ensure that the kubelet device plugin socket exists before we start
 # A brief sleep is needed to avoid the `test` failing its first check
 ExecStartPre=/usr/bin/sleep 0.1

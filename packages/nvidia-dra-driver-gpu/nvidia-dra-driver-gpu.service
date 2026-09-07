@@ -2,7 +2,6 @@
 Description=NVIDIA DRA driver GPU kubelet plugin
 After=kubelet.service
 Wants=kubelet.service
-Conflicts=nvidia-k8s-device-plugin.service nvidia-mps-control-daemon.service
 After=nvidia-k8s-device-plugin.service nvidia-mps-control-daemon.service
 # Only meaningful on a node that actually has an NVIDIA GPU present.
 ConditionPathExists=/dev/nvidiactl
