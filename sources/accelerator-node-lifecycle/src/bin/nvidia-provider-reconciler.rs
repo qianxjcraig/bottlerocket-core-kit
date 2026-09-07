@@ -6,14 +6,20 @@ use std::process::{Command, ExitCode, Output};
 const KUBELET_UNIT: &str = "kubelet.service";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const SYSTEMD_INACTIVE_EXIT_CODE: i32 = 3;
+const PROVIDERS: [NvidiaProvider; 3] = [
+    NvidiaProvider::DevicePlugin,
+    NvidiaProvider::MpsControlDaemon,
+    NvidiaProvider::DraDriver,
+];
+const START_ORDER: [NvidiaProvider; 3] = [
+    NvidiaProvider::MpsControlDaemon,
+    NvidiaProvider::DevicePlugin,
+    NvidiaProvider::DraDriver,
+];
 
-/// Restart one NVIDIA resource provider after Bottlerocket settings change.
+/// Reconcile NVIDIA resource providers after a Bottlerocket settings change.
 #[derive(FromArgs)]
-struct Args {
-    /// NVIDIA provider systemd unit
-    #[argh(positional, from_str_fn(parse_provider))]
-    provider: NvidiaProvider,
-}
+struct Args {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NvidiaProvider {
@@ -51,12 +57,34 @@ impl fmt::Display for NvidiaProvider {
     }
 }
 
-fn parse_provider(value: &str) -> Result<NvidiaProvider, String> {
-    match value {
-        "nvidia-k8s-device-plugin.service" => Ok(NvidiaProvider::DevicePlugin),
-        "nvidia-mps-control-daemon.service" => Ok(NvidiaProvider::MpsControlDaemon),
-        "nvidia-dra-driver-gpu.service" => Ok(NvidiaProvider::DraDriver),
-        _ => Err(format!("unsupported NVIDIA provider unit '{value}'")),
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ProviderSelection {
+    device_plugin: bool,
+    mps_control_daemon: bool,
+    dra_driver: bool,
+}
+
+impl ProviderSelection {
+    fn includes(&self, provider: NvidiaProvider) -> bool {
+        match provider {
+            NvidiaProvider::DevicePlugin => self.device_plugin,
+            NvidiaProvider::MpsControlDaemon => self.mps_control_daemon,
+            NvidiaProvider::DraDriver => self.dra_driver,
+        }
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        if self.dra_driver && (self.device_plugin || self.mps_control_daemon) {
+            return Err(io::Error::other(
+                "rendered configuration selects DRA and legacy NVIDIA providers together",
+            ));
+        }
+        if self.mps_control_daemon && !self.device_plugin {
+            return Err(io::Error::other(
+                "rendered configuration selects NVIDIA MPS without the device plugin",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -124,30 +152,48 @@ fn command_failure(action: &str, unit: &str, output: &Output) -> io::Error {
     ))
 }
 
-fn reconcile<M: ServiceManager>(
-    provider: NvidiaProvider,
+fn rendered_selection<M: ServiceManager>(
     service_manager: &mut M,
-) -> io::Result<()> {
+) -> io::Result<ProviderSelection> {
+    let mut selection = ProviderSelection::default();
+    for provider in PROVIDERS {
+        let selected = provider.is_selected(&service_manager.exec_start(provider.unit())?);
+        match provider {
+            NvidiaProvider::DevicePlugin => selection.device_plugin = selected,
+            NvidiaProvider::MpsControlDaemon => selection.mps_control_daemon = selected,
+            NvidiaProvider::DraDriver => selection.dra_driver = selected,
+        }
+    }
+    selection.validate()?;
+    Ok(selection)
+}
+
+fn reconcile<M: ServiceManager>(service_manager: &mut M) -> io::Result<()> {
     // During first boot settings are rendered before kubelet starts.  Let
     // normal systemd ordering start the enabled provider at multi-user.target.
     if !service_manager.is_active(KUBELET_UNIT)? {
         return Ok(());
     }
 
-    let exec_start = service_manager.exec_start(provider.unit())?;
-    if provider.is_selected(&exec_start) {
-        service_manager.restart(provider.unit())
-    } else {
-        // Every provider is affected by the atomic mode setting.  Stop an
-        // unselected placeholder instead of starting it, which would stop the
-        // selected peer through systemd's symmetric Conflicts= relationship.
-        service_manager.stop(provider.unit())
+    let selection = rendered_selection(service_manager)?;
+
+    // Stop every provider first so no order returned by settings-applier can
+    // leave mutually exclusive providers active.  MPS starts before the device
+    // plugin because the legacy unit requires it when MPS sharing is enabled.
+    for provider in PROVIDERS {
+        service_manager.stop(provider.unit())?;
     }
+    for provider in START_ORDER {
+        if selection.includes(provider) {
+            service_manager.restart(provider.unit())?;
+        }
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {
-    let args: Args = argh::from_env();
-    match reconcile(args.provider, &mut Systemd) {
+    let _: Args = argh::from_env();
+    match reconcile(&mut Systemd) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
@@ -159,6 +205,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[derive(Default)]
     struct FakeServiceManager {
@@ -167,7 +214,31 @@ mod tests {
         restarts: Vec<String>,
         stops: Vec<String>,
         exec_start_queries: Vec<String>,
-        exec_start: String,
+        exec_starts: HashMap<String, String>,
+    }
+
+    impl FakeServiceManager {
+        fn with_selection(selected: &[NvidiaProvider]) -> Self {
+            let exec_starts = PROVIDERS
+                .into_iter()
+                .map(|provider| {
+                    let executable = if selected.contains(&provider) {
+                        provider.executable()
+                    } else {
+                        "/usr/bin/true"
+                    };
+                    (
+                        provider.unit().to_string(),
+                        format!("{{ path={executable} ; argv[]={executable} }}"),
+                    )
+                })
+                .collect();
+            Self {
+                kubelet_active: true,
+                exec_starts,
+                ..Default::default()
+            }
+        }
     }
 
     impl ServiceManager for FakeServiceManager {
@@ -178,7 +249,7 @@ mod tests {
 
         fn exec_start(&mut self, unit: &str) -> io::Result<String> {
             self.exec_start_queries.push(unit.to_string());
-            Ok(self.exec_start.clone())
+            Ok(self.exec_starts.get(unit).cloned().unwrap_or_default())
         }
 
         fn stop(&mut self, unit: &str) -> io::Result<()> {
@@ -193,93 +264,89 @@ mod tests {
     }
 
     #[test]
-    fn first_boot_does_not_start_a_provider_before_kubelet() {
+    fn first_boot_leaves_provider_startup_to_systemd() {
         let mut manager = FakeServiceManager::default();
 
-        reconcile(NvidiaProvider::DraDriver, &mut manager).unwrap();
+        reconcile(&mut manager).unwrap();
 
         assert_eq!(manager.active_queries, [KUBELET_UNIT]);
-        assert!(manager.restarts.is_empty());
-        assert!(manager.stops.is_empty());
         assert!(manager.exec_start_queries.is_empty());
-    }
-
-    #[test]
-    fn settings_change_restarts_a_selected_provider() {
-        for provider in [
-            NvidiaProvider::DevicePlugin,
-            NvidiaProvider::MpsControlDaemon,
-            NvidiaProvider::DraDriver,
-        ] {
-            let mut manager = FakeServiceManager {
-                kubelet_active: true,
-                exec_start: format!(
-                    "{{ path={} ; argv[]={}; ignore_errors=no }}",
-                    provider.executable(),
-                    provider.executable()
-                ),
-                ..Default::default()
-            };
-
-            reconcile(provider, &mut manager).unwrap();
-
-            assert_eq!(manager.active_queries, [KUBELET_UNIT]);
-            assert_eq!(manager.exec_start_queries, [provider.unit()]);
-            assert_eq!(manager.restarts, [provider.unit()]);
-            assert!(manager.stops.is_empty());
-        }
-    }
-
-    #[test]
-    fn settings_change_stops_an_unselected_placeholder() {
-        let mut manager = FakeServiceManager {
-            kubelet_active: true,
-            exec_start: "path=/usr/bin/true ; argv[]=/usr/bin/true".to_string(),
-            ..Default::default()
-        };
-        for provider in [
-            NvidiaProvider::DevicePlugin,
-            NvidiaProvider::MpsControlDaemon,
-            NvidiaProvider::DraDriver,
-        ] {
-            reconcile(provider, &mut manager).unwrap();
-        }
-
-        assert_eq!(manager.active_queries, [KUBELET_UNIT; 3]);
-        assert_eq!(
-            manager.exec_start_queries,
-            [
-                "nvidia-k8s-device-plugin.service",
-                "nvidia-mps-control-daemon.service",
-                "nvidia-dra-driver-gpu.service",
-            ]
-        );
+        assert!(manager.stops.is_empty());
         assert!(manager.restarts.is_empty());
+    }
+
+    #[test]
+    fn disabled_mode_stops_all_providers() {
+        let mut manager = FakeServiceManager::with_selection(&[]);
+
+        reconcile(&mut manager).unwrap();
+
+        assert_eq!(manager.exec_start_queries, provider_units());
+        assert_eq!(manager.stops, provider_units());
+        assert!(manager.restarts.is_empty());
+    }
+
+    #[test]
+    fn device_plugin_mode_starts_only_the_device_plugin() {
+        let mut manager =
+            FakeServiceManager::with_selection(&[NvidiaProvider::DevicePlugin]);
+
+        reconcile(&mut manager).unwrap();
+
+        assert_eq!(manager.stops, provider_units());
+        assert_eq!(manager.restarts, ["nvidia-k8s-device-plugin.service"]);
+    }
+
+    #[test]
+    fn mps_mode_starts_mps_before_the_device_plugin() {
+        let mut manager = FakeServiceManager::with_selection(&[
+            NvidiaProvider::DevicePlugin,
+            NvidiaProvider::MpsControlDaemon,
+        ]);
+
+        reconcile(&mut manager).unwrap();
+
+        assert_eq!(manager.stops, provider_units());
         assert_eq!(
-            manager.stops,
+            manager.restarts,
             [
-                "nvidia-k8s-device-plugin.service",
                 "nvidia-mps-control-daemon.service",
-                "nvidia-dra-driver-gpu.service",
+                "nvidia-k8s-device-plugin.service",
             ]
         );
     }
 
     #[test]
-    fn supported_provider_unit_names_are_stable() {
-        for (unit, provider) in [
-            (
-                "nvidia-k8s-device-plugin.service",
+    fn dra_mode_starts_only_the_dra_driver() {
+        let mut manager = FakeServiceManager::with_selection(&[NvidiaProvider::DraDriver]);
+
+        reconcile(&mut manager).unwrap();
+
+        assert_eq!(manager.stops, provider_units());
+        assert_eq!(manager.restarts, ["nvidia-dra-driver-gpu.service"]);
+    }
+
+    #[test]
+    fn contradictory_provider_selection_is_rejected_before_changes() {
+        for selected in [
+            vec![
                 NvidiaProvider::DevicePlugin,
-            ),
-            (
-                "nvidia-mps-control-daemon.service",
-                NvidiaProvider::MpsControlDaemon,
-            ),
-            ("nvidia-dra-driver-gpu.service", NvidiaProvider::DraDriver),
+                NvidiaProvider::DraDriver,
+            ],
+            vec![NvidiaProvider::MpsControlDaemon],
         ] {
-            assert_eq!(parse_provider(unit).unwrap(), provider);
-            assert_eq!(provider.unit(), unit);
+            let mut manager = FakeServiceManager::with_selection(&selected);
+
+            assert!(reconcile(&mut manager).is_err());
+            assert!(manager.stops.is_empty());
+            assert!(manager.restarts.is_empty());
+        }
+    }
+
+    #[test]
+    fn provider_unit_and_executable_names_are_stable() {
+        for provider in PROVIDERS {
+            assert!(provider.unit().starts_with("nvidia-"));
             assert!(provider.is_selected(&format!("path={} ;", provider.executable())));
             assert!(
                 !provider.is_selected(&format!("path={}-unexpected ;", provider.executable()))
@@ -287,9 +354,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn unsupported_provider_is_rejected() {
-        let error = parse_provider("containerd.service").unwrap_err();
-        assert!(error.contains("unsupported NVIDIA provider unit"));
+    fn provider_units() -> Vec<String> {
+        PROVIDERS
+            .into_iter()
+            .map(|provider| provider.unit().to_string())
+            .collect()
     }
 }
