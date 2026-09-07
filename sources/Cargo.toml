@@ -22,6 +22,7 @@ members = [
     "api/prairiedog",
     "api/simple-settings-plugin",
     "aws-smithy-experimental",
+    "accelerator-node-lifecycle",
 
     "bloodhound",
 

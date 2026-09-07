@@ -1,0 +1,12 @@
+[package]
+name = "accelerator-node-lifecycle"
+version = "0.1.0"
+license = "Apache-2.0 OR MIT"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+snafu.workspace = true
+tempfile.workspace = true
