@@ -1,0 +1,19 @@
+[Unit]
+Description=Resume durable accelerator node lifecycle work
+After=apiserver.service settings-applier.service systemd-tmpfiles-setup.service kubelet.service
+Requires=apiserver.service
+Wants=kubelet.service
+ConditionPathExists=/var/lib/accelerator-node-lifecycle/state.json
+StartLimitIntervalSec=60
+StartLimitBurst=6
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/accelerator-node-lifecycle-resume
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=240
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

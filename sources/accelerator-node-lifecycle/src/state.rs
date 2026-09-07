@@ -174,6 +174,12 @@ impl LifecycleState {
             .map(|transition| transition.target_profile)
     }
 
+    pub fn previous_profile(&self) -> Option<AcceleratorProfile> {
+        self.active_transition
+            .as_ref()
+            .and_then(|transition| transition.previous_profile)
+    }
+
     pub fn phase(&self) -> Option<TransitionPhase> {
         self.active_transition
             .as_ref()
