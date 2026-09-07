@@ -1,6 +1,7 @@
 [Unit]
 Description=NVIDIA MPS Control Daemon
 Before=nvidia-k8s-device-plugin.service
+Conflicts=nvidia-dra-driver-gpu.service
 
 [Service]
 ExecStart=/usr/bin/true

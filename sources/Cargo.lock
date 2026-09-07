@@ -56,10 +56,12 @@ version = "0.1.0"
 dependencies = [
  "argh",
  "fs2",
+ "schnauzer",
  "serde",
  "serde_json",
  "snafu",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -1,7 +1,25 @@
 [required-extensions]
+accelerators = "v1"
 kubelet-device-plugins = "v1"
 std = { version = "v1", helpers = ["if_not_null", "default"] }
 +++
+{{#if_not_null settings.accelerators.nvidia.mode}}
+{{#if (eq settings.accelerators.nvidia.mode "device-plugin")}}
+{{#if (eq settings.kubelet-device-plugins.nvidia.device-sharing-strategy "mps")}}
+[Service]
+ExecStart=
+{{#if (eq settings.kubelet-device-plugins.nvidia.device-partitioning-strategy "mig")}}
+# MPS and MIG are not supported at the same time
+Type=oneshot
+ExecStart=/bin/echo "MPS and MIG are not supported at the same time"
+{{else}}
+Type=simple
+ExecStart=/usr/bin/mps-control-daemon --config-file /etc/nvidia-k8s-device-plugin/settings.yaml
+RemainAfterExit=no
+{{/if}}
+{{/if}}
+{{/if}}
+{{else}}
 {{#if_not_null settings.kubelet-device-plugins.nvidia}}
 {{#if (eq (default "true" settings.kubelet-device-plugins.nvidia.enabled) "true")}}
 {{#if (eq settings.kubelet-device-plugins.nvidia.device-sharing-strategy "mps")}}
@@ -18,4 +36,5 @@ RemainAfterExit=no
 {{/if}}
 {{/if}}
 {{/if}}
+{{/if_not_null}}
 {{/if_not_null}}
