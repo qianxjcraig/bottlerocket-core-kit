@@ -168,18 +168,16 @@ fn rendered_selection<M: ServiceManager>(service_manager: &mut M) -> io::Result<
 }
 
 fn reconcile<M: ServiceManager>(service_manager: &mut M) -> io::Result<()> {
-    // During first boot settings are rendered before kubelet and the boot
-    // target start. Let normal systemd ordering start the enabled provider.
-    // Once boot is complete, an inactive kubelet is an outage rather than a
-    // startup condition. Fail without touching providers so the settings
-    // change can be retried after kubelet recovers.
-    if !service_manager.is_active(KUBELET_UNIT)? {
-        if !service_manager.is_active(BOOT_COMPLETION_UNIT)? {
-            return Ok(());
-        }
-        return Err(io::Error::other(
-            "refusing to reconcile NVIDIA providers while kubelet is inactive after boot",
-        ));
+    // Before the boot target starts, settings are being rendered for first
+    // boot; normal systemd ordering will start the selected provider. After
+    // boot, reconcile even if kubelet is currently inactive. Each selected
+    // resource provider orders itself after and wants kubelet, so starting the
+    // provider also recovers kubelet without leaving the previous provider
+    // active against newly rendered configuration.
+    if !service_manager.is_active(KUBELET_UNIT)?
+        && !service_manager.is_active(BOOT_COMPLETION_UNIT)?
+    {
+        return Ok(());
     }
 
     let selection = rendered_selection(service_manager)?;
@@ -286,17 +284,16 @@ mod tests {
     }
 
     #[test]
-    fn runtime_kubelet_outage_fails_without_changing_providers() {
-        let mut manager = FakeServiceManager::default();
-        manager
-            .active_units
-            .insert(BOOT_COMPLETION_UNIT.to_string(), true);
+    fn runtime_kubelet_outage_reconciles_selected_provider() {
+        let mut manager = FakeServiceManager::with_selection(&[NvidiaProvider::DraDriver]);
+        manager.active_units.remove(KUBELET_UNIT);
 
-        assert!(reconcile(&mut manager).is_err());
+        reconcile(&mut manager).unwrap();
+
         assert_eq!(manager.active_queries, [KUBELET_UNIT, BOOT_COMPLETION_UNIT]);
-        assert!(manager.exec_start_queries.is_empty());
-        assert!(manager.stops.is_empty());
-        assert!(manager.restarts.is_empty());
+        assert_eq!(manager.exec_start_queries, provider_units());
+        assert_eq!(manager.stops, provider_units());
+        assert_eq!(manager.restarts, ["nvidia-dra-driver-gpu.service"]);
     }
 
     #[test]
