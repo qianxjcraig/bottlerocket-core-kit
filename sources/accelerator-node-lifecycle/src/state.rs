@@ -43,10 +43,12 @@ pub enum TransitionPhase {
     IntentPersisted,
     NodeDrained,
     AdvertisementWithdrawn,
+    TargetProfileRebootRequired,
     TargetProfileApplied,
     TargetDraValidated,
     TargetQualified,
     RestorePending,
+    PreviousProfileRebootRequired,
     PreviousProfileApplied,
     PreviousDraValidated,
     Blocked,
@@ -290,13 +292,27 @@ impl LifecycleState {
         )
     }
 
-    pub fn record_target_profile_applied(
+    pub fn record_target_profile_reboot_required(
         &mut self,
         id: &TransitionId,
     ) -> Result<(), LifecycleError> {
         self.advance(
             id,
             TransitionPhase::AdvertisementWithdrawn,
+            TransitionPhase::TargetProfileRebootRequired,
+        )
+    }
+
+    pub fn record_target_profile_applied(
+        &mut self,
+        id: &TransitionId,
+    ) -> Result<(), LifecycleError> {
+        self.advance_from(
+            id,
+            &[
+                TransitionPhase::AdvertisementWithdrawn,
+                TransitionPhase::TargetProfileRebootRequired,
+            ],
             TransitionPhase::TargetProfileApplied,
         )
     }
@@ -361,6 +377,7 @@ impl LifecycleState {
         let transition = self.transition_mut(id)?;
         match transition.phase {
             TransitionPhase::RestorePending
+            | TransitionPhase::PreviousProfileRebootRequired
             | TransitionPhase::PreviousProfileApplied
             | TransitionPhase::PreviousDraValidated
             | TransitionPhase::Blocked => {
@@ -384,13 +401,27 @@ impl LifecycleState {
         Ok(())
     }
 
-    pub fn record_previous_profile_applied(
+    pub fn record_previous_profile_reboot_required(
         &mut self,
         id: &TransitionId,
     ) -> Result<(), LifecycleError> {
         self.advance(
             id,
             TransitionPhase::RestorePending,
+            TransitionPhase::PreviousProfileRebootRequired,
+        )
+    }
+
+    pub fn record_previous_profile_applied(
+        &mut self,
+        id: &TransitionId,
+    ) -> Result<(), LifecycleError> {
+        self.advance_from(
+            id,
+            &[
+                TransitionPhase::RestorePending,
+                TransitionPhase::PreviousProfileRebootRequired,
+            ],
             TransitionPhase::PreviousProfileApplied,
         )
     }
@@ -436,10 +467,14 @@ impl LifecycleState {
             TransitionPhase::IntentPersisted => NextAction::CoordinatorDrainNode,
             TransitionPhase::NodeDrained => NextAction::NodeWithdrawAdvertisement,
             TransitionPhase::AdvertisementWithdrawn => NextAction::NodeApplyTargetProfile,
+            TransitionPhase::TargetProfileRebootRequired => {
+                NextAction::NodeApplyTargetProfile
+            }
             TransitionPhase::TargetProfileApplied => NextAction::NodeValidateTargetDra,
             TransitionPhase::TargetDraValidated => NextAction::CoordinatorRunQualification,
             TransitionPhase::TargetQualified => NextAction::NodeCommitTarget,
             TransitionPhase::RestorePending => NextAction::NodeApplyPreviousProfile,
+            TransitionPhase::PreviousProfileRebootRequired => NextAction::NodeApplyPreviousProfile,
             TransitionPhase::PreviousProfileApplied => NextAction::NodeValidatePreviousDra,
             TransitionPhase::PreviousDraValidated => NextAction::NodeCommitRestore,
             TransitionPhase::Blocked => NextAction::ManualIntervention,
@@ -509,6 +544,30 @@ impl LifecycleState {
         if transition.phase != expected {
             return UnexpectedPhaseSnafu {
                 expected,
+                actual: transition.phase,
+            }
+            .fail();
+        }
+        transition.phase = next;
+        Ok(())
+    }
+
+    fn advance_from(
+        &mut self,
+        id: &TransitionId,
+        expected: &[TransitionPhase],
+        next: TransitionPhase,
+    ) -> Result<(), LifecycleError> {
+        let transition = self.transition_mut(id)?;
+        if transition.phase == next {
+            return Ok(());
+        }
+        if !expected.contains(&transition.phase) {
+            return UnexpectedPhaseSnafu {
+                expected: expected
+                    .first()
+                    .copied()
+                    .expect("advance_from requires an expected phase"),
                 actual: transition.phase,
             }
             .fail();
@@ -819,5 +878,43 @@ mod tests {
             state.next_action(),
             Some(NextAction::CoordinatorRunQualification)
         );
+    }
+
+    #[test]
+    fn target_reboot_requirement_is_durable_and_resumable() {
+        let mut state = LifecycleState::default();
+        let id = begin(&mut state, AcceleratorProfile::SharedInference);
+        state.record_node_drained(&id).unwrap();
+        state.record_advertisement_withdrawn(&id).unwrap();
+
+        state.record_target_profile_reboot_required(&id).unwrap();
+        assert_eq!(
+            state.phase(),
+            Some(TransitionPhase::TargetProfileRebootRequired)
+        );
+        assert_eq!(
+            state.next_action(),
+            Some(NextAction::NodeApplyTargetProfile)
+        );
+
+        state.record_target_profile_applied(&id).unwrap();
+        assert_eq!(state.phase(), Some(TransitionPhase::TargetProfileApplied));
+    }
+
+    #[test]
+    fn restore_reboot_requirement_is_durable_and_resumable() {
+        let mut state = LifecycleState::new(Some(AcceleratorProfile::SharedInference));
+        let id = begin(&mut state, AcceleratorProfile::DistributedTraining);
+        state.record_node_drained(&id).unwrap();
+        state.request_restore(&id, "qualification failed").unwrap();
+
+        state.record_previous_profile_reboot_required(&id).unwrap();
+        assert_eq!(
+            state.next_action(),
+            Some(NextAction::NodeApplyPreviousProfile)
+        );
+
+        state.record_previous_profile_applied(&id).unwrap();
+        assert_eq!(state.phase(), Some(TransitionPhase::PreviousProfileApplied));
     }
 }

@@ -13,7 +13,8 @@ mod store;
 pub use locked_store::{LockedJsonFileStore, LockedJsonFileStoreGuard, LockedStoreError};
 pub use node_executor::{BottlerocketNodeActionExecutor, NodeExecutorError};
 pub use resume::{
-    execute_next_node_action, NodeAction, NodeActionExecutor, ResumeError, ResumeStatus,
+    execute_next_node_action, NodeAction, NodeActionExecutor, ProfileApplyResult, ResumeError,
+    ResumeStatus,
 };
 pub use state::{
     AcceleratorProfile, LifecycleError, LifecycleState, NextAction, TransitionId,

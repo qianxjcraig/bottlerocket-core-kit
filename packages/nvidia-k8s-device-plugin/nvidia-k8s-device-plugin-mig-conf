@@ -11,6 +11,17 @@ device-partitioning-strategy = "{{{settings.kubelet-device-plugins.nvidia.device
 {{#if_not_null settings.kubelet-device-plugins.nvidia.mig.profile}}
 profile = {{ toml_encode settings.kubelet-device-plugins.nvidia.mig.profile }}
 {{/if_not_null}}
+{{else}}
+{{#if (eq settings.accelerators.nvidia.mode "dra-shared-inference")}}
+device-partitioning-strategy = "mig"
+{{#if_not_null settings.accelerators.nvidia.mig.profile}}
+profile = {{ toml_encode settings.accelerators.nvidia.mig.profile }}
+{{/if_not_null}}
+{{else}}
+{{#if (eq settings.accelerators.nvidia.mode "dra-distributed-training")}}
+device-partitioning-strategy = "none"
+{{/if}}
+{{/if}}
 {{/if}}
 {{else}}
 {{#if_not_null settings.kubelet-device-plugins.nvidia}}

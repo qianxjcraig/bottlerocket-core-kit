@@ -46,6 +46,11 @@ fn explicit_mode(mode: &str) -> Value {
             "accelerators": {
                 "nvidia": {
                     "mode": mode,
+                    "mig": {
+                        "profile": {
+                            "a100.40gb": "2g.10gb",
+                        },
+                    },
                 },
             },
             "kubernetes": {
@@ -88,7 +93,10 @@ async fn explicit_device_plugin_mode_selects_only_legacy_provider() {
 
 #[tokio::test]
 async fn dra_profiles_select_only_dra_provider() {
-    for mode in ["dra-shared-inference", "dra-distributed-training"] {
+    for (mode, partitioning_strategy) in [
+        ("dra-shared-inference", "mig"),
+        ("dra-distributed-training", "none"),
+    ] {
         let settings = explicit_mode(mode);
         let device_plugin = render(DEVICE_PLUGIN_TEMPLATE, settings.clone()).await;
         let dra = render(DRA_TEMPLATE, settings.clone()).await;
@@ -101,9 +109,21 @@ async fn dra_profiles_select_only_dra_provider() {
         assert!(dra.contains(
             "Conflicts=nvidia-k8s-device-plugin.service nvidia-mps-control-daemon.service"
         ));
-        assert!(dra
-            .contains("After=nvidia-k8s-device-plugin.service nvidia-mps-control-daemon.service"));
-        assert!(mig.trim().is_empty());
+        assert!(dra.contains("Requires=nvidia-migmanager.service"));
+        assert!(dra.contains(
+            "After=nvidia-k8s-device-plugin.service nvidia-mps-control-daemon.service nvidia-migmanager.service"
+        ));
+        assert!(dra.contains("ConditionPathExists=!/run/nvidia-migmanager/reboot-required"));
+        assert!(dra.contains("ExecStartPre=/usr/bin/nvidia-migmanager validate-mig"));
+        assert!(mig.contains(&format!(
+            "device-partitioning-strategy = \"{partitioning_strategy}\""
+        )));
+        if mode == "dra-shared-inference" {
+            assert!(mig.contains("2g.10gb"));
+            assert!(!mig.contains("1g.5gb"));
+        } else {
+            assert!(!mig.contains("profile ="));
+        }
         assert!(mps.trim().is_empty());
     }
 }

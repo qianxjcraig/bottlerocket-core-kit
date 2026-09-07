@@ -1,4 +1,4 @@
-use crate::{AcceleratorProfile, NodeActionExecutor};
+use crate::{AcceleratorProfile, NodeActionExecutor, ProfileApplyResult};
 use serde_json::Value;
 use snafu::{ResultExt, Snafu};
 #[cfg(test)]
@@ -10,10 +10,13 @@ use std::time::Duration;
 
 const APICLIENT: &str = "/usr/bin/apiclient";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
+const PROVIDER_RECONCILER: &str = "/usr/bin/nvidia-provider-reconciler";
+const NVIDIA_MIGMANAGER: &str = "/usr/bin/nvidia-migmanager";
 const KUBELET_UNIT: &str = "kubelet.service";
 const DEVICE_PLUGIN_UNIT: &str = "nvidia-k8s-device-plugin.service";
 const MPS_UNIT: &str = "nvidia-mps-control-daemon.service";
 const DRA_UNIT: &str = "nvidia-dra-driver-gpu.service";
+const MIG_REBOOT_REQUIRED: &str = "/run/nvidia-migmanager/reboot-required";
 const DISABLED_MODE: &str = "disabled";
 const SHARED_INFERENCE_MODE: &str = "dra-shared-inference";
 const DISTRIBUTED_TRAINING_MODE: &str = "dra-distributed-training";
@@ -36,14 +39,35 @@ impl BottlerocketNodeActionExecutor {
         }
     }
 
-    fn set_mode_and_wait(&mut self, expected_mode: &'static str) -> Result<(), NodeExecutorError> {
-        if self.system.current_mode()?.as_deref() != Some(expected_mode) {
-            self.system.set_mode(expected_mode)?;
+    fn set_mode_and_wait(
+        &mut self,
+        expected_mode: &'static str,
+    ) -> Result<ProfileApplyResult, NodeExecutorError> {
+        let current_mode = self.system.current_mode()?;
+        if current_mode.as_deref() == Some(expected_mode) && self.system.mig_reboot_required()? {
+            return Ok(ProfileApplyResult::RebootRequired);
         }
-        self.wait_for_convergence(expected_mode)
+
+        if current_mode.as_deref() != Some(expected_mode) {
+            self.system.set_mode(expected_mode)?;
+        } else {
+            // A persisted mode may need reconciliation after reboot or after a
+            // previous settings-applier failure.
+            self.system.reconcile_providers()?;
+        }
+
+        if self.system.mig_reboot_required()? {
+            return Ok(ProfileApplyResult::RebootRequired);
+        }
+
+        self.wait_for_convergence(expected_mode)?;
+        Ok(ProfileApplyResult::Converged)
     }
 
     fn validate_mode(&mut self, expected_mode: &'static str) -> Result<(), NodeExecutorError> {
+        if self.system.mig_reboot_required()? {
+            return RebootStillRequiredSnafu.fail();
+        }
         let actual = self.system.current_mode()?;
         if actual.as_deref() != Some(expected_mode) {
             return UnexpectedModeSnafu {
@@ -52,7 +76,9 @@ impl BottlerocketNodeActionExecutor {
             }
             .fail();
         }
-        self.wait_for_convergence(expected_mode)
+        self.wait_for_convergence(expected_mode)?;
+        self.system.validate_hardware_profile()?;
+        Ok(())
     }
 
     fn wait_for_convergence(
@@ -88,10 +114,18 @@ impl NodeActionExecutor for BottlerocketNodeActionExecutor {
     type Error = NodeExecutorError;
 
     fn withdraw_advertisement(&mut self) -> Result<(), Self::Error> {
-        self.set_mode_and_wait(DISABLED_MODE)
+        match self.set_mode_and_wait(DISABLED_MODE)? {
+            ProfileApplyResult::Converged => Ok(()),
+            ProfileApplyResult::RebootRequired => {
+                UnexpectedRebootForDisabledModeSnafu.fail()
+            }
+        }
     }
 
-    fn apply_profile(&mut self, profile: AcceleratorProfile) -> Result<(), Self::Error> {
+    fn apply_profile(
+        &mut self,
+        profile: AcceleratorProfile,
+    ) -> Result<ProfileApplyResult, Self::Error> {
         self.set_mode_and_wait(mode_for_profile(profile))
     }
 
@@ -132,6 +166,9 @@ trait SystemInterface {
     fn set_mode(&mut self, mode: &str) -> Result<(), NodeExecutorError>;
     fn current_mode(&mut self) -> Result<Option<String>, NodeExecutorError>;
     fn provider_state(&mut self) -> Result<ProviderState, NodeExecutorError>;
+    fn reconcile_providers(&mut self) -> Result<(), NodeExecutorError>;
+    fn mig_reboot_required(&mut self) -> Result<bool, NodeExecutorError>;
+    fn validate_hardware_profile(&mut self) -> Result<(), NodeExecutorError>;
     fn sleep(&mut self, duration: Duration);
     #[cfg(test)]
     fn as_any(&self) -> &dyn Any;
@@ -164,6 +201,21 @@ impl SystemInterface for System {
             mps: unit_is_active(MPS_UNIT)?,
             dra: unit_is_active(DRA_UNIT)?,
         })
+    }
+
+    fn reconcile_providers(&mut self) -> Result<(), NodeExecutorError> {
+        let output = run(PROVIDER_RECONCILER, &[])?;
+        command_succeeded(PROVIDER_RECONCILER, &[], &output)
+    }
+
+    fn mig_reboot_required(&mut self) -> Result<bool, NodeExecutorError> {
+        Ok(std::path::Path::new(MIG_REBOOT_REQUIRED).exists())
+    }
+
+    fn validate_hardware_profile(&mut self) -> Result<(), NodeExecutorError> {
+        let arguments = ["validate-mig"];
+        let output = run(NVIDIA_MIGMANAGER, &arguments)?;
+        command_succeeded(NVIDIA_MIGMANAGER, &arguments, &output)
     }
 
     fn sleep(&mut self, duration: Duration) {
@@ -238,6 +290,14 @@ pub enum NodeExecutorError {
         actual: String,
     },
 
+    #[snafu(display("NVIDIA hardware profile still requires a node reboot"))]
+    RebootStillRequired,
+
+    #[snafu(display(
+        "disabled NVIDIA provider mode unexpectedly requested a hardware-profile reboot"
+    ))]
+    UnexpectedRebootForDisabledMode,
+
     #[snafu(display(
         "NVIDIA providers did not converge to mode '{}'; last observed state: {}",
         expected,
@@ -259,6 +319,9 @@ mod tests {
         states: VecDeque<ProviderState>,
         set_modes: Vec<String>,
         sleeps: usize,
+        reconciles: usize,
+        reboot_required: bool,
+        hardware_validations: usize,
     }
 
     impl FakeSystem {
@@ -268,6 +331,9 @@ mod tests {
                 states: states.into_iter().collect(),
                 set_modes: Vec::new(),
                 sleeps: 0,
+                reconciles: 0,
+                reboot_required: false,
+                hardware_validations: 0,
             }
         }
     }
@@ -289,6 +355,20 @@ mod tests {
             } else {
                 self.states.front().cloned().unwrap_or_default()
             })
+        }
+
+        fn reconcile_providers(&mut self) -> Result<(), NodeExecutorError> {
+            self.reconciles += 1;
+            Ok(())
+        }
+
+        fn mig_reboot_required(&mut self) -> Result<bool, NodeExecutorError> {
+            Ok(self.reboot_required)
+        }
+
+        fn validate_hardware_profile(&mut self) -> Result<(), NodeExecutorError> {
+            self.hardware_validations += 1;
+            Ok(())
         }
 
         fn sleep(&mut self, _duration: Duration) {
@@ -375,6 +455,7 @@ mod tests {
             .downcast_ref::<FakeSystem>()
             .expect("fake system");
         assert!(fake.set_modes.is_empty());
+        assert_eq!(fake.reconciles, 1);
     }
 
     #[test]
@@ -390,6 +471,44 @@ mod tests {
                 .unwrap_err(),
             NodeExecutorError::UnexpectedMode { .. }
         ));
+    }
+
+    #[test]
+    fn apply_profile_reports_reboot_required_without_waiting_for_provider() {
+        let mut system = FakeSystem::new(Some(DISABLED_MODE), [disabled_state()]);
+        system.reboot_required = true;
+        let mut executor = executor(system);
+
+        let outcome = executor
+            .apply_profile(AcceleratorProfile::SharedInference)
+            .unwrap();
+
+        assert_eq!(outcome, ProfileApplyResult::RebootRequired);
+        let fake = executor
+            .system
+            .as_any()
+            .downcast_ref::<FakeSystem>()
+            .expect("fake system");
+        assert_eq!(fake.sleeps, 0);
+    }
+
+    #[test]
+    fn validation_rechecks_the_hardware_profile() {
+        let mut executor = executor(FakeSystem::new(
+            Some(SHARED_INFERENCE_MODE),
+            [dra_state()],
+        ));
+
+        executor
+            .validate_dra(AcceleratorProfile::SharedInference)
+            .unwrap();
+
+        let fake = executor
+            .system
+            .as_any()
+            .downcast_ref::<FakeSystem>()
+            .expect("fake system");
+        assert_eq!(fake.hardware_validations, 1);
     }
 
     #[test]

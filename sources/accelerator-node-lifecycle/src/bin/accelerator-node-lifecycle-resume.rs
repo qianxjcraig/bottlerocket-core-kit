@@ -59,6 +59,10 @@ where
                     .into());
                 }
             }
+            ResumeStatus::RebootRequired { .. } => {
+                guard.save(&state)?;
+                break status;
+            }
             terminal => break terminal,
         }
     };
@@ -82,7 +86,7 @@ struct OwnedReport {
 mod tests {
     use super::*;
     use accelerator_node_lifecycle::{
-        AcceleratorProfile, JsonFileStore, NextAction, NodeActionExecutor,
+        AcceleratorProfile, JsonFileStore, NextAction, NodeActionExecutor, ProfileApplyResult, TransitionPhase,
     };
     use std::io;
     use tempfile::TempDir;
@@ -91,6 +95,7 @@ mod tests {
     struct FakeExecutor {
         actions: Vec<NodeAction>,
         fail_on: Option<NodeAction>,
+        reboot_required: bool,
     }
 
     impl FakeExecutor {
@@ -110,8 +115,16 @@ mod tests {
             self.run(NodeAction::WithdrawAdvertisement)
         }
 
-        fn apply_profile(&mut self, profile: AcceleratorProfile) -> Result<(), Self::Error> {
-            self.run(NodeAction::ApplyProfile(profile))
+        fn apply_profile(
+            &mut self,
+            profile: AcceleratorProfile,
+        ) -> Result<ProfileApplyResult, Self::Error> {
+            self.run(NodeAction::ApplyProfile(profile))?;
+            if self.reboot_required {
+                Ok(ProfileApplyResult::RebootRequired)
+            } else {
+                Ok(ProfileApplyResult::Converged)
+            }
         }
 
         fn validate_dra(&mut self, profile: AcceleratorProfile) -> Result<(), Self::Error> {
@@ -161,6 +174,38 @@ mod tests {
         assert_eq!(
             persisted.next_action(),
             Some(NextAction::CoordinatorRunQualification)
+        );
+    }
+
+    #[test]
+    fn reboot_requirement_is_persisted_before_exit() {
+        let directory = TempDir::new().unwrap();
+        let state_path = directory.path().join("state.json");
+        node_drained_state(&state_path);
+        let mut executor = FakeExecutor {
+            reboot_required: true,
+            ..Default::default()
+        };
+
+        let report = execute(
+            Args {
+                state_path: state_path.clone(),
+            },
+            &mut executor,
+        )
+        .unwrap();
+
+        assert_eq!(report.completed_actions, vec![NodeAction::WithdrawAdvertisement]);
+        assert_eq!(
+            report.status,
+            ResumeStatus::RebootRequired {
+                action: NodeAction::ApplyProfile(AcceleratorProfile::SharedInference),
+            }
+        );
+        let persisted = JsonFileStore::new(state_path).load().unwrap();
+        assert_eq!(
+            persisted.phase(),
+            Some(TransitionPhase::TargetProfileRebootRequired)
         );
     }
 

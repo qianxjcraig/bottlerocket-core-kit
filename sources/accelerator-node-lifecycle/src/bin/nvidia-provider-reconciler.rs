@@ -6,6 +6,8 @@ use std::process::{Command, ExitCode, Output};
 const KUBELET_UNIT: &str = "kubelet.service";
 const BOOT_COMPLETION_UNIT: &str = "multi-user.target";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
+const NVIDIA_MIGMANAGER: &str = "/usr/bin/nvidia-migmanager";
+const MIG_REBOOT_REQUIRED: &str = "/run/nvidia-migmanager/reboot-required";
 const SYSTEMD_INACTIVE_EXIT_CODE: i32 = 3;
 const PROVIDERS: [NvidiaProvider; 3] = [
     NvidiaProvider::DevicePlugin,
@@ -87,6 +89,10 @@ impl ProviderSelection {
         }
         Ok(())
     }
+
+    fn is_empty(&self) -> bool {
+        !self.device_plugin && !self.mps_control_daemon && !self.dra_driver
+    }
 }
 
 trait ServiceManager {
@@ -94,6 +100,8 @@ trait ServiceManager {
     fn exec_start(&mut self, unit: &str) -> io::Result<String>;
     fn stop(&mut self, unit: &str) -> io::Result<()>;
     fn restart(&mut self, unit: &str) -> io::Result<()>;
+    fn apply_mig_profile(&mut self) -> io::Result<()>;
+    fn mig_reboot_required(&mut self) -> io::Result<bool>;
 }
 
 struct Systemd;
@@ -142,6 +150,25 @@ impl ServiceManager for Systemd {
             Err(command_failure("restart", unit, &output))
         }
     }
+
+    fn apply_mig_profile(&mut self) -> io::Result<()> {
+        let output = Command::new(NVIDIA_MIGMANAGER)
+            .arg("apply-mig")
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(command_failure(
+                "apply accelerator hardware profile with",
+                NVIDIA_MIGMANAGER,
+                &output,
+            ))
+        }
+    }
+
+    fn mig_reboot_required(&mut self) -> io::Result<bool> {
+        Ok(std::path::Path::new(MIG_REBOOT_REQUIRED).exists())
+    }
 }
 
 fn command_failure(action: &str, unit: &str, output: &Output) -> io::Error {
@@ -188,6 +215,16 @@ fn reconcile<M: ServiceManager>(service_manager: &mut M) -> io::Result<()> {
     for provider in PROVIDERS {
         service_manager.stop(provider.unit())?;
     }
+
+    if !selection.is_empty() {
+        service_manager.apply_mig_profile()?;
+        // Ampere GPUs require a reboot to complete MIG mode changes. Leave all
+        // resource providers stopped so no stale or partial inventory is advertised.
+        if service_manager.mig_reboot_required()? {
+            return Ok(());
+        }
+    }
+
     for provider in START_ORDER {
         if selection.includes(provider) {
             service_manager.restart(provider.unit())?;
@@ -220,6 +257,8 @@ mod tests {
         stops: Vec<String>,
         exec_start_queries: Vec<String>,
         exec_starts: HashMap<String, String>,
+        mig_applies: usize,
+        mig_reboot_required: bool,
     }
 
     impl FakeServiceManager {
@@ -269,6 +308,15 @@ mod tests {
             self.restarts.push(unit.to_string());
             Ok(())
         }
+
+        fn apply_mig_profile(&mut self) -> io::Result<()> {
+            self.mig_applies += 1;
+            Ok(())
+        }
+
+        fn mig_reboot_required(&mut self) -> io::Result<bool> {
+            Ok(self.mig_reboot_required)
+        }
     }
 
     #[test]
@@ -281,6 +329,7 @@ mod tests {
         assert!(manager.exec_start_queries.is_empty());
         assert!(manager.stops.is_empty());
         assert!(manager.restarts.is_empty());
+        assert_eq!(manager.mig_applies, 0);
     }
 
     #[test]
@@ -294,6 +343,7 @@ mod tests {
         assert_eq!(manager.exec_start_queries, provider_units());
         assert_eq!(manager.stops, provider_units());
         assert_eq!(manager.restarts, ["nvidia-dra-driver-gpu.service"]);
+        assert_eq!(manager.mig_applies, 1);
     }
 
     #[test]
@@ -305,6 +355,7 @@ mod tests {
         assert_eq!(manager.exec_start_queries, provider_units());
         assert_eq!(manager.stops, provider_units());
         assert!(manager.restarts.is_empty());
+        assert_eq!(manager.mig_applies, 0);
     }
 
     #[test]
@@ -315,6 +366,7 @@ mod tests {
 
         assert_eq!(manager.stops, provider_units());
         assert_eq!(manager.restarts, ["nvidia-k8s-device-plugin.service"]);
+        assert_eq!(manager.mig_applies, 1);
     }
 
     #[test]
@@ -334,6 +386,7 @@ mod tests {
                 "nvidia-k8s-device-plugin.service",
             ]
         );
+        assert_eq!(manager.mig_applies, 1);
     }
 
     #[test]
@@ -344,6 +397,19 @@ mod tests {
 
         assert_eq!(manager.stops, provider_units());
         assert_eq!(manager.restarts, ["nvidia-dra-driver-gpu.service"]);
+        assert_eq!(manager.mig_applies, 1);
+    }
+
+    #[test]
+    fn reboot_required_keeps_every_provider_stopped() {
+        let mut manager = FakeServiceManager::with_selection(&[NvidiaProvider::DraDriver]);
+        manager.mig_reboot_required = true;
+
+        reconcile(&mut manager).unwrap();
+
+        assert_eq!(manager.stops, provider_units());
+        assert_eq!(manager.mig_applies, 1);
+        assert!(manager.restarts.is_empty());
     }
 
     #[test]

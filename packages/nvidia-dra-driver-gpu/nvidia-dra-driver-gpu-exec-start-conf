@@ -21,11 +21,16 @@ RemainAfterExit=true
 {{else}}
 [Unit]
 Conflicts=nvidia-k8s-device-plugin.service nvidia-mps-control-daemon.service
-After=nvidia-k8s-device-plugin.service nvidia-mps-control-daemon.service
+Requires=nvidia-migmanager.service
+After=nvidia-k8s-device-plugin.service nvidia-mps-control-daemon.service nvidia-migmanager.service
+ConditionPathExists=!/run/nvidia-migmanager/reboot-required
 
 [Service]
 ExecStartPre=/usr/bin/sleep 0.1
 ExecStartPre=/usr/bin/test -d /var/lib/kubelet/plugins_registry
+# Never publish a ResourceSlice until the physical GPU state exactly matches
+# the selected shared-MIG or full-GPU accelerator profile.
+ExecStartPre=/usr/bin/nvidia-migmanager validate-mig
 # NVIDIA DRA GPU kubelet plugin. It registers with the local kubelet, discovers
 # GPUs via NVML on the host (driver root is "/" on Bottlerocket), writes CDI
 # specs into /etc/cdi (a containerd CDI spec dir), and publishes ResourceSlices

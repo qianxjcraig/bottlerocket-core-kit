@@ -14,6 +14,14 @@ pub enum NodeAction {
     CommitRestore,
 }
 
+/// Result of applying a node-local accelerator hardware profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProfileApplyResult {
+    Converged,
+    RebootRequired,
+}
+
 /// The result of one resume-engine decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case", tag = "status", content = "detail")]
@@ -21,6 +29,7 @@ pub enum ResumeStatus {
     Idle,
     WaitingForCoordinator { action: NextAction },
     ManualIntervention,
+    RebootRequired { action: NodeAction },
     ActionCompleted { action: NodeAction },
 }
 
@@ -29,7 +38,10 @@ pub trait NodeActionExecutor {
     type Error: Error;
 
     fn withdraw_advertisement(&mut self) -> Result<(), Self::Error>;
-    fn apply_profile(&mut self, profile: AcceleratorProfile) -> Result<(), Self::Error>;
+    fn apply_profile(
+        &mut self,
+        profile: AcceleratorProfile,
+    ) -> Result<ProfileApplyResult, Self::Error>;
     fn validate_dra(&mut self, profile: AcceleratorProfile) -> Result<(), Self::Error>;
 }
 
@@ -67,13 +79,25 @@ where
             let profile = state
                 .target_profile()
                 .ok_or(ResumeError::InconsistentState("target profile is missing"))?;
-            executor
+            let outcome = executor
                 .apply_profile(profile)
                 .map_err(ResumeError::Executor)?;
-            state
-                .record_target_profile_applied(&id)
-                .map_err(ResumeError::Lifecycle)?;
-            completed(NodeAction::ApplyProfile(profile))
+            match outcome {
+                ProfileApplyResult::Converged => {
+                    state
+                        .record_target_profile_applied(&id)
+                        .map_err(ResumeError::Lifecycle)?;
+                    completed(NodeAction::ApplyProfile(profile))
+                }
+                ProfileApplyResult::RebootRequired => {
+                    state
+                        .record_target_profile_reboot_required(&id)
+                        .map_err(ResumeError::Lifecycle)?;
+                    Ok(ResumeStatus::RebootRequired {
+                        action: NodeAction::ApplyProfile(profile),
+                    })
+                }
+            }
         }
         NextAction::NodeValidateTargetDra => {
             let id = active_id(state)?;
@@ -100,13 +124,25 @@ where
                 .ok_or(ResumeError::InconsistentState(
                     "previous profile is missing during restoration",
                 ))?;
-            executor
+            let outcome = executor
                 .apply_profile(profile)
                 .map_err(ResumeError::Executor)?;
-            state
-                .record_previous_profile_applied(&id)
-                .map_err(ResumeError::Lifecycle)?;
-            completed(NodeAction::ApplyProfile(profile))
+            match outcome {
+                ProfileApplyResult::Converged => {
+                    state
+                        .record_previous_profile_applied(&id)
+                        .map_err(ResumeError::Lifecycle)?;
+                    completed(NodeAction::ApplyProfile(profile))
+                }
+                ProfileApplyResult::RebootRequired => {
+                    state
+                        .record_previous_profile_reboot_required(&id)
+                        .map_err(ResumeError::Lifecycle)?;
+                    Ok(ResumeStatus::RebootRequired {
+                        action: NodeAction::ApplyProfile(profile),
+                    })
+                }
+            }
         }
         NextAction::NodeValidatePreviousDra => {
             let id = active_id(state)?;
@@ -191,6 +227,7 @@ mod tests {
     struct FakeExecutor {
         actions: Vec<NodeAction>,
         failure: Option<&'static str>,
+        reboot_required: bool,
     }
 
     impl NodeActionExecutor for FakeExecutor {
@@ -200,8 +237,16 @@ mod tests {
             self.execute(NodeAction::WithdrawAdvertisement)
         }
 
-        fn apply_profile(&mut self, profile: AcceleratorProfile) -> Result<(), Self::Error> {
-            self.execute(NodeAction::ApplyProfile(profile))
+        fn apply_profile(
+            &mut self,
+            profile: AcceleratorProfile,
+        ) -> Result<ProfileApplyResult, Self::Error> {
+            self.execute(NodeAction::ApplyProfile(profile))?;
+            if self.reboot_required {
+                Ok(ProfileApplyResult::RebootRequired)
+            } else {
+                Ok(ProfileApplyResult::Converged)
+            }
         }
 
         fn validate_dra(&mut self, profile: AcceleratorProfile) -> Result<(), Self::Error> {
@@ -304,6 +349,35 @@ mod tests {
             Err(ResumeError::Executor(_))
         ));
         assert_eq!(state, original);
+    }
+
+    #[test]
+    fn reboot_requirement_advances_to_a_durable_resume_phase() {
+        let mut state = LifecycleState::default();
+        let id = begin(&mut state, AcceleratorProfile::SharedInference);
+        state.record_node_drained(&id).unwrap();
+        state.record_advertisement_withdrawn(&id).unwrap();
+        let mut executor = FakeExecutor {
+            reboot_required: true,
+            ..Default::default()
+        };
+
+        let status = execute_next_node_action(&mut state, &mut executor).unwrap();
+
+        assert_eq!(
+            status,
+            ResumeStatus::RebootRequired {
+                action: NodeAction::ApplyProfile(AcceleratorProfile::SharedInference),
+            }
+        );
+        assert_eq!(
+            state.phase(),
+            Some(crate::TransitionPhase::TargetProfileRebootRequired)
+        );
+        assert_eq!(
+            state.next_action(),
+            Some(NextAction::NodeApplyTargetProfile)
+        );
     }
 
     #[test]
