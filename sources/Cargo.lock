@@ -51,6 +51,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "accelerator-node-lifecycle"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "snafu",
+ "tempfile",
+]
+
+[[package]]
 name = "actix"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

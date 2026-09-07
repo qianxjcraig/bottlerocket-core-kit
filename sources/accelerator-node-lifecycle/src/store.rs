@@ -28,11 +28,10 @@ impl JsonFileStore {
                 return Ok(LifecycleState::default());
             }
             Err(source) => {
-                return OpenStateSnafu {
+                return Err(StoreError::OpenState {
                     path: self.path.clone(),
                     source,
-                }
-                .fail();
+                });
             }
         };
 
