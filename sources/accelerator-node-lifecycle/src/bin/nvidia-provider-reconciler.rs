@@ -30,6 +30,19 @@ impl NvidiaProvider {
             Self::DraDriver => "nvidia-dra-driver-gpu.service",
         }
     }
+
+    fn executable(self) -> &'static str {
+        match self {
+            Self::DevicePlugin => "/usr/bin/nvidia-device-plugin",
+            Self::MpsControlDaemon => "/usr/bin/mps-control-daemon",
+            Self::DraDriver => "/usr/bin/gpu-kubelet-plugin",
+        }
+    }
+
+    fn is_selected(self, exec_start: &str) -> bool {
+        let expected_path = format!("path={} ;", self.executable());
+        exec_start.contains(&expected_path)
+    }
 }
 
 impl fmt::Display for NvidiaProvider {
@@ -49,6 +62,8 @@ fn parse_provider(value: &str) -> Result<NvidiaProvider, String> {
 
 trait ServiceManager {
     fn is_active(&mut self, unit: &str) -> io::Result<bool>;
+    fn exec_start(&mut self, unit: &str) -> io::Result<String>;
+    fn stop(&mut self, unit: &str) -> io::Result<()>;
     fn restart(&mut self, unit: &str) -> io::Result<()>;
 }
 
@@ -68,6 +83,26 @@ impl ServiceManager for Systemd {
         }
 
         Err(command_failure("query active state for", unit, &output))
+    }
+
+    fn exec_start(&mut self, unit: &str) -> io::Result<String> {
+        let output = Command::new(SYSTEMCTL)
+            .args(["show", "--property=ExecStart", "--value", unit])
+            .output()?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        } else {
+            Err(command_failure("query ExecStart for", unit, &output))
+        }
+    }
+
+    fn stop(&mut self, unit: &str) -> io::Result<()> {
+        let output = Command::new(SYSTEMCTL).args(["stop", unit]).output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(command_failure("stop", unit, &output))
+        }
     }
 
     fn restart(&mut self, unit: &str) -> io::Result<()> {
@@ -99,7 +134,15 @@ fn reconcile<M: ServiceManager>(
         return Ok(());
     }
 
-    service_manager.restart(provider.unit())
+    let exec_start = service_manager.exec_start(provider.unit())?;
+    if provider.is_selected(&exec_start) {
+        service_manager.restart(provider.unit())
+    } else {
+        // Every provider is affected by the atomic mode setting.  Stop an
+        // unselected placeholder instead of starting it, which would stop the
+        // selected peer through systemd's symmetric Conflicts= relationship.
+        service_manager.stop(provider.unit())
+    }
 }
 
 fn main() -> ExitCode {
@@ -122,12 +165,25 @@ mod tests {
         kubelet_active: bool,
         active_queries: Vec<String>,
         restarts: Vec<String>,
+        stops: Vec<String>,
+        exec_start_queries: Vec<String>,
+        exec_start: String,
     }
 
     impl ServiceManager for FakeServiceManager {
         fn is_active(&mut self, unit: &str) -> io::Result<bool> {
             self.active_queries.push(unit.to_string());
             Ok(self.kubelet_active)
+        }
+
+        fn exec_start(&mut self, unit: &str) -> io::Result<String> {
+            self.exec_start_queries.push(unit.to_string());
+            Ok(self.exec_start.clone())
+        }
+
+        fn stop(&mut self, unit: &str) -> io::Result<()> {
+            self.stops.push(unit.to_string());
+            Ok(())
         }
 
         fn restart(&mut self, unit: &str) -> io::Result<()> {
@@ -144,19 +200,69 @@ mod tests {
 
         assert_eq!(manager.active_queries, [KUBELET_UNIT]);
         assert!(manager.restarts.is_empty());
+        assert!(manager.stops.is_empty());
+        assert!(manager.exec_start_queries.is_empty());
     }
 
     #[test]
-    fn settings_change_restarts_only_the_requested_provider() {
+    fn settings_change_restarts_a_selected_provider() {
+        for provider in [
+            NvidiaProvider::DevicePlugin,
+            NvidiaProvider::MpsControlDaemon,
+            NvidiaProvider::DraDriver,
+        ] {
+            let mut manager = FakeServiceManager {
+                kubelet_active: true,
+                exec_start: format!(
+                    "{{ path={} ; argv[]={}; ignore_errors=no }}",
+                    provider.executable(),
+                    provider.executable()
+                ),
+                ..Default::default()
+            };
+
+            reconcile(provider, &mut manager).unwrap();
+
+            assert_eq!(manager.active_queries, [KUBELET_UNIT]);
+            assert_eq!(manager.exec_start_queries, [provider.unit()]);
+            assert_eq!(manager.restarts, [provider.unit()]);
+            assert!(manager.stops.is_empty());
+        }
+    }
+
+    #[test]
+    fn settings_change_stops_an_unselected_placeholder() {
         let mut manager = FakeServiceManager {
             kubelet_active: true,
+            exec_start: "path=/usr/bin/true ; argv[]=/usr/bin/true".to_string(),
             ..Default::default()
         };
+        for provider in [
+            NvidiaProvider::DevicePlugin,
+            NvidiaProvider::MpsControlDaemon,
+            NvidiaProvider::DraDriver,
+        ] {
+            reconcile(provider, &mut manager).unwrap();
+        }
 
-        reconcile(NvidiaProvider::DevicePlugin, &mut manager).unwrap();
-
-        assert_eq!(manager.active_queries, [KUBELET_UNIT]);
-        assert_eq!(manager.restarts, ["nvidia-k8s-device-plugin.service"]);
+        assert_eq!(manager.active_queries, [KUBELET_UNIT; 3]);
+        assert_eq!(
+            manager.exec_start_queries,
+            [
+                "nvidia-k8s-device-plugin.service",
+                "nvidia-mps-control-daemon.service",
+                "nvidia-dra-driver-gpu.service",
+            ]
+        );
+        assert!(manager.restarts.is_empty());
+        assert_eq!(
+            manager.stops,
+            [
+                "nvidia-k8s-device-plugin.service",
+                "nvidia-mps-control-daemon.service",
+                "nvidia-dra-driver-gpu.service",
+            ]
+        );
     }
 
     #[test]
@@ -174,6 +280,10 @@ mod tests {
         ] {
             assert_eq!(parse_provider(unit).unwrap(), provider);
             assert_eq!(provider.unit(), unit);
+            assert!(provider.is_selected(&format!("path={} ;", provider.executable())));
+            assert!(
+                !provider.is_selected(&format!("path={}-unexpected ;", provider.executable()))
+            );
         }
     }
 
