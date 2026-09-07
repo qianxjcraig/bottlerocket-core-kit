@@ -10,6 +10,7 @@ ExecStart=
 {{#if (eq settings.accelerators.nvidia.mode "device-plugin")}}
 [Unit]
 Conflicts=nvidia-dra-driver-gpu.service
+After=nvidia-dra-driver-gpu.service
 
 [Service]
 # Ensure that the kubelet device plugin socket exists before we start
@@ -29,6 +30,7 @@ RemainAfterExit=true
 {{#if (eq (default "true" settings.kubelet-device-plugins.nvidia.enabled) "true")}}
 [Unit]
 Conflicts=nvidia-dra-driver-gpu.service
+After=nvidia-dra-driver-gpu.service
 
 [Service]
 # Ensure that the kubelet device plugin socket exists before we start

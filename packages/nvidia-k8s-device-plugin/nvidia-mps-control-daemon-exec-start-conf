@@ -8,6 +8,7 @@ std = { version = "v1", helpers = ["if_not_null", "default"] }
 {{#if (eq settings.kubelet-device-plugins.nvidia.device-sharing-strategy "mps")}}
 [Unit]
 Conflicts=nvidia-dra-driver-gpu.service
+After=nvidia-dra-driver-gpu.service
 
 [Service]
 ExecStart=
@@ -28,6 +29,7 @@ RemainAfterExit=no
 {{#if (eq settings.kubelet-device-plugins.nvidia.device-sharing-strategy "mps")}}
 [Unit]
 Conflicts=nvidia-dra-driver-gpu.service
+After=nvidia-dra-driver-gpu.service
 
 [Service]
 ExecStart=

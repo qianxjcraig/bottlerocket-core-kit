@@ -21,6 +21,7 @@ RemainAfterExit=true
 {{else}}
 [Unit]
 Conflicts=nvidia-k8s-device-plugin.service nvidia-mps-control-daemon.service
+After=nvidia-k8s-device-plugin.service nvidia-mps-control-daemon.service
 
 [Service]
 ExecStartPre=/usr/bin/sleep 0.1
