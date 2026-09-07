@@ -22,12 +22,13 @@ const SHARED_INFERENCE_MODE: &str = "dra-shared-inference";
 const DISTRIBUTED_TRAINING_MODE: &str = "dra-distributed-training";
 const SYSTEMD_INACTIVE_EXIT_CODE: i32 = 3;
 const CONVERGENCE_ATTEMPTS: usize = 61;
+const PROFILE_CONVERGENCE_ATTEMPTS: usize = 121;
 const CONVERGENCE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Applies and locally validates Bottlerocket's NVIDIA provider selection.
 ///
-/// This executor validates the setting and systemd provider state only. Kubernetes ResourceSlice,
-/// CDI, MIG geometry, and workload qualification belong to later lifecycle validation stages.
+/// This executor validates the setting, systemd provider state, and local NVIDIA hardware profile.
+/// Kubernetes ResourceSlice, CDI, and workload qualification belong to later validation stages.
 pub struct BottlerocketNodeActionExecutor {
     system: Box<dyn SystemInterface>,
 }
@@ -60,6 +61,10 @@ impl BottlerocketNodeActionExecutor {
             return Ok(ProfileApplyResult::RebootRequired);
         }
 
+        if expected_mode == SHARED_INFERENCE_MODE || expected_mode == DISTRIBUTED_TRAINING_MODE {
+            return self.wait_for_profile_convergence(expected_mode);
+        }
+
         self.wait_for_convergence(expected_mode)?;
         Ok(ProfileApplyResult::Converged)
     }
@@ -79,6 +84,43 @@ impl BottlerocketNodeActionExecutor {
         self.wait_for_convergence(expected_mode)?;
         self.system.validate_hardware_profile()?;
         Ok(())
+    }
+
+    fn wait_for_profile_convergence(
+        &mut self,
+        expected_mode: &'static str,
+    ) -> Result<ProfileApplyResult, NodeExecutorError> {
+        let mut last = self.system.provider_state()?;
+        let mut last_hardware_error = String::from("<hardware validation not attempted>");
+
+        for attempt in 0..PROFILE_CONVERGENCE_ATTEMPTS {
+            if self.system.mig_reboot_required()? {
+                return Ok(ProfileApplyResult::RebootRequired);
+            }
+
+            if last.matches_mode(expected_mode) {
+                match self.system.validate_hardware_profile() {
+                    Ok(()) => return Ok(ProfileApplyResult::Converged),
+                    Err(error) => last_hardware_error = error.to_string(),
+                }
+            }
+
+            if attempt + 1 < PROFILE_CONVERGENCE_ATTEMPTS {
+                self.system.sleep(CONVERGENCE_INTERVAL);
+                last = self.system.provider_state()?;
+            }
+        }
+
+        if self.system.mig_reboot_required()? {
+            return Ok(ProfileApplyResult::RebootRequired);
+        }
+
+        ProfileConvergenceSnafu {
+            expected: expected_mode,
+            actual: format!("{last:?}"),
+            hardware_error: last_hardware_error,
+        }
+        .fail()
     }
 
     fn wait_for_convergence(
@@ -297,6 +339,19 @@ pub enum NodeExecutorError {
     UnexpectedRebootForDisabledMode,
 
     #[snafu(display(
+        "NVIDIA profile did not converge to mode '{}'; last provider state: {}; \
+         last hardware validation error: {}",
+        expected,
+        actual,
+        hardware_error
+    ))]
+    ProfileConvergence {
+        expected: &'static str,
+        actual: String,
+        hardware_error: String,
+    },
+
+    #[snafu(display(
         "NVIDIA providers did not converge to mode '{}'; last observed state: {}",
         expected,
         actual
@@ -320,6 +375,8 @@ mod tests {
         reconciles: usize,
         reboot_required: bool,
         hardware_validations: usize,
+        reboot_required_after_sleeps: Option<usize>,
+        hardware_validation_failures: usize,
     }
 
     impl FakeSystem {
@@ -332,6 +389,8 @@ mod tests {
                 reconciles: 0,
                 reboot_required: false,
                 hardware_validations: 0,
+                reboot_required_after_sleeps: None,
+                hardware_validation_failures: 0,
             }
         }
     }
@@ -361,11 +420,25 @@ mod tests {
         }
 
         fn mig_reboot_required(&mut self) -> Result<bool, NodeExecutorError> {
-            Ok(self.reboot_required)
+            let delayed_reboot_required = self
+                .reboot_required_after_sleeps
+                .map(|threshold| self.sleeps >= threshold)
+                .unwrap_or(false);
+            Ok(self.reboot_required || delayed_reboot_required)
         }
 
         fn validate_hardware_profile(&mut self) -> Result<(), NodeExecutorError> {
             self.hardware_validations += 1;
+            if self.hardware_validation_failures > 0 {
+                self.hardware_validation_failures -= 1;
+                return Err(NodeExecutorError::CommandFailed {
+                    command: format!("{NVIDIA_MIGMANAGER} validate-mig"),
+                    status: String::from("exit status: 1"),
+                    stderr: String::from(
+                        "synthetic hardware profile mismatch while settings converge",
+                    ),
+                });
+            }
             Ok(())
         }
 
@@ -488,6 +561,55 @@ mod tests {
             .downcast_ref::<FakeSystem>()
             .expect("fake system");
         assert_eq!(fake.sleeps, 0);
+    }
+
+    #[test]
+    fn stale_dra_service_waits_for_a_delayed_reboot_marker() {
+        let mut system = FakeSystem::new(Some(DISTRIBUTED_TRAINING_MODE), [dra_state()]);
+        system.hardware_validation_failures = PROFILE_CONVERGENCE_ATTEMPTS;
+        system.reboot_required_after_sleeps = Some(1);
+        let mut executor = executor(system);
+
+        let outcome = executor
+            .apply_profile(AcceleratorProfile::SharedInference)
+            .unwrap();
+
+        assert_eq!(outcome, ProfileApplyResult::RebootRequired);
+        let fake = executor
+            .system
+            .as_any()
+            .downcast_ref::<FakeSystem>()
+            .expect("fake system");
+        assert_eq!(
+            fake.set_modes,
+            vec![SHARED_INFERENCE_MODE.to_string()]
+        );
+        assert_eq!(fake.hardware_validations, 1);
+        assert_eq!(fake.sleeps, 1);
+    }
+
+    #[test]
+    fn stale_hardware_without_a_reboot_waits_until_the_profile_converges() {
+        let mut system = FakeSystem::new(Some(DISTRIBUTED_TRAINING_MODE), [dra_state()]);
+        system.hardware_validation_failures = 1;
+        let mut executor = executor(system);
+
+        let outcome = executor
+            .apply_profile(AcceleratorProfile::SharedInference)
+            .unwrap();
+
+        assert_eq!(outcome, ProfileApplyResult::Converged);
+        let fake = executor
+            .system
+            .as_any()
+            .downcast_ref::<FakeSystem>()
+            .expect("fake system");
+        assert_eq!(
+            fake.set_modes,
+            vec![SHARED_INFERENCE_MODE.to_string()]
+        );
+        assert_eq!(fake.hardware_validations, 2);
+        assert_eq!(fake.sleeps, 1);
     }
 
     #[test]
