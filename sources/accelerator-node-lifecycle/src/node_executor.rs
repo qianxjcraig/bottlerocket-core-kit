@@ -402,7 +402,7 @@ mod tests {
         };
         let mut executor = executor(FakeSystem::new(
             Some(SHARED_INFERENCE_MODE),
-            std::iter::repeat(conflicting).take(CONVERGENCE_ATTEMPTS),
+            std::iter::repeat_n(conflicting, CONVERGENCE_ATTEMPTS),
         ));
 
         assert!(matches!(

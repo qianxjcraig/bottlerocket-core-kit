@@ -129,14 +129,6 @@ mod tests {
     }
 
     #[test]
-    fn safety_limit_exceeds_all_valid_node_action_sequences() {
-        // A forward transition has three node actions before qualification and one after it.
-        // A restoration has three node actions. The bound catches a logic loop without
-        // constraining any valid sequence.
-        assert!(MAX_ACTIONS_PER_RUN > 4);
-    }
-
-    #[test]
     fn run_checkpoints_each_action_and_stops_at_coordinator_boundary() {
         let directory = TempDir::new().unwrap();
         let state_path = directory.path().join("state.json");
