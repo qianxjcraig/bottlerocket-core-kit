@@ -4,6 +4,7 @@ use std::io;
 use std::process::{Command, ExitCode, Output};
 
 const KUBELET_UNIT: &str = "kubelet.service";
+const BOOT_COMPLETION_UNIT: &str = "multi-user.target";
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const SYSTEMD_INACTIVE_EXIT_CODE: i32 = 3;
 const PROVIDERS: [NvidiaProvider; 3] = [
@@ -169,10 +170,18 @@ fn rendered_selection<M: ServiceManager>(
 }
 
 fn reconcile<M: ServiceManager>(service_manager: &mut M) -> io::Result<()> {
-    // During first boot settings are rendered before kubelet starts.  Let
-    // normal systemd ordering start the enabled provider at multi-user.target.
+    // During first boot settings are rendered before kubelet and the boot
+    // target start. Let normal systemd ordering start the enabled provider.
+    // Once boot is complete, an inactive kubelet is an outage rather than a
+    // startup condition. Fail without touching providers so the settings
+    // change can be retried after kubelet recovers.
     if !service_manager.is_active(KUBELET_UNIT)? {
-        return Ok(());
+        if !service_manager.is_active(BOOT_COMPLETION_UNIT)? {
+            return Ok(());
+        }
+        return Err(io::Error::other(
+            "refusing to reconcile NVIDIA providers while kubelet is inactive after boot",
+        ));
     }
 
     let selection = rendered_selection(service_manager)?;
@@ -209,7 +218,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeServiceManager {
-        kubelet_active: bool,
+        active_units: HashMap<String, bool>,
         active_queries: Vec<String>,
         restarts: Vec<String>,
         stops: Vec<String>,
@@ -234,7 +243,10 @@ mod tests {
                 })
                 .collect();
             Self {
-                kubelet_active: true,
+                active_units: HashMap::from([
+                    (KUBELET_UNIT.to_string(), true),
+                    (BOOT_COMPLETION_UNIT.to_string(), true),
+                ]),
                 exec_starts,
                 ..Default::default()
             }
@@ -244,7 +256,7 @@ mod tests {
     impl ServiceManager for FakeServiceManager {
         fn is_active(&mut self, unit: &str) -> io::Result<bool> {
             self.active_queries.push(unit.to_string());
-            Ok(self.kubelet_active)
+            Ok(self.active_units.get(unit).copied().unwrap_or(false))
         }
 
         fn exec_start(&mut self, unit: &str) -> io::Result<String> {
@@ -269,7 +281,27 @@ mod tests {
 
         reconcile(&mut manager).unwrap();
 
-        assert_eq!(manager.active_queries, [KUBELET_UNIT]);
+        assert_eq!(
+            manager.active_queries,
+            [KUBELET_UNIT, BOOT_COMPLETION_UNIT]
+        );
+        assert!(manager.exec_start_queries.is_empty());
+        assert!(manager.stops.is_empty());
+        assert!(manager.restarts.is_empty());
+    }
+
+    #[test]
+    fn runtime_kubelet_outage_fails_without_changing_providers() {
+        let mut manager = FakeServiceManager::default();
+        manager
+            .active_units
+            .insert(BOOT_COMPLETION_UNIT.to_string(), true);
+
+        assert!(reconcile(&mut manager).is_err());
+        assert_eq!(
+            manager.active_queries,
+            [KUBELET_UNIT, BOOT_COMPLETION_UNIT]
+        );
         assert!(manager.exec_start_queries.is_empty());
         assert!(manager.stops.is_empty());
         assert!(manager.restarts.is_empty());
