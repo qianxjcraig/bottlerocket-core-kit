@@ -86,6 +86,7 @@ async fn explicit_device_plugin_mode_selects_only_legacy_provider() {
     assert!(!dra.contains("ExecStart=/usr/bin/gpu-kubelet-plugin"));
     assert!(!dra.contains("Conflicts=nvidia-k8s-device-plugin.service"));
     assert!(mig.contains("device-partitioning-strategy = \"mig\""));
+    assert!(!mig.contains("strict-validation"));
     assert!(mps.contains("MPS and MIG are not supported at the same time"));
     assert!(mps.contains("Conflicts=nvidia-dra-driver-gpu.service"));
     assert!(mps.contains("After=nvidia-dra-driver-gpu.service"));
@@ -115,6 +116,7 @@ async fn dra_profiles_select_only_dra_provider() {
         ));
         assert!(dra.contains("ConditionPathExists=!/run/nvidia-migmanager/reboot-required"));
         assert!(dra.contains("ExecStartPre=/usr/bin/nvidia-migmanager validate-mig"));
+        assert!(mig.contains("strict-validation = true"));
         assert!(mig.contains(&format!(
             "device-partitioning-strategy = \"{partitioning_strategy}\""
         )));
