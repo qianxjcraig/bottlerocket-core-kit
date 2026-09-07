@@ -106,11 +106,9 @@ impl JsonFileStore {
             .context(WriteNotificationSnafu {
                 path: &self.notification_path,
             })?;
-        notification
-            .sync_all()
-            .context(SyncNotificationSnafu {
-                path: &self.notification_path,
-            })?;
+        notification.sync_all().context(SyncNotificationSnafu {
+            path: &self.notification_path,
+        })?;
         parent_directory
             .sync_all()
             .context(SyncStateDirectorySnafu { path: parent })?;
@@ -240,10 +238,7 @@ mod tests {
             "notification inode must remain stable across atomic state replacement"
         );
         assert_eq!(second_notification.len(), 1);
-        assert_eq!(
-            second_notification.permissions().mode() & 0o777,
-            0o600
-        );
+        assert_eq!(second_notification.permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

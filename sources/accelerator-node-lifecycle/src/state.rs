@@ -467,9 +467,7 @@ impl LifecycleState {
             TransitionPhase::IntentPersisted => NextAction::CoordinatorDrainNode,
             TransitionPhase::NodeDrained => NextAction::NodeWithdrawAdvertisement,
             TransitionPhase::AdvertisementWithdrawn => NextAction::NodeApplyTargetProfile,
-            TransitionPhase::TargetProfileRebootRequired => {
-                NextAction::NodeApplyTargetProfile
-            }
+            TransitionPhase::TargetProfileRebootRequired => NextAction::NodeApplyTargetProfile,
             TransitionPhase::TargetProfileApplied => NextAction::NodeValidateTargetDra,
             TransitionPhase::TargetDraValidated => NextAction::CoordinatorRunQualification,
             TransitionPhase::TargetQualified => NextAction::NodeCommitTarget,

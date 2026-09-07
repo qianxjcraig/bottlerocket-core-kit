@@ -116,9 +116,7 @@ impl NodeActionExecutor for BottlerocketNodeActionExecutor {
     fn withdraw_advertisement(&mut self) -> Result<(), Self::Error> {
         match self.set_mode_and_wait(DISABLED_MODE)? {
             ProfileApplyResult::Converged => Ok(()),
-            ProfileApplyResult::RebootRequired => {
-                UnexpectedRebootForDisabledModeSnafu.fail()
-            }
+            ProfileApplyResult::RebootRequired => UnexpectedRebootForDisabledModeSnafu.fail(),
         }
     }
 
@@ -494,10 +492,7 @@ mod tests {
 
     #[test]
     fn validation_rechecks_the_hardware_profile() {
-        let mut executor = executor(FakeSystem::new(
-            Some(SHARED_INFERENCE_MODE),
-            [dra_state()],
-        ));
+        let mut executor = executor(FakeSystem::new(Some(SHARED_INFERENCE_MODE), [dra_state()]));
 
         executor
             .validate_dra(AcceleratorProfile::SharedInference)

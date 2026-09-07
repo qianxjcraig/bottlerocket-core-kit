@@ -152,9 +152,7 @@ impl ServiceManager for Systemd {
     }
 
     fn apply_mig_profile(&mut self) -> io::Result<()> {
-        let output = Command::new(NVIDIA_MIGMANAGER)
-            .arg("apply-mig")
-            .output()?;
+        let output = Command::new(NVIDIA_MIGMANAGER).arg("apply-mig").output()?;
         if output.status.success() {
             Ok(())
         } else {

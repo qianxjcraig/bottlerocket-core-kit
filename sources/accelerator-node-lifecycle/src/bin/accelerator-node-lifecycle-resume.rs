@@ -47,6 +47,7 @@ where
     let mut completed_actions = Vec::new();
 
     let status = loop {
+        let state_before_action = state.clone();
         let status = execute_next_node_action(&mut state, executor)?;
         match status {
             ResumeStatus::ActionCompleted { action } => {
@@ -60,7 +61,9 @@ where
                 }
             }
             ResumeStatus::RebootRequired { .. } => {
-                guard.save(&state)?;
+                if state != state_before_action {
+                    guard.save(&state)?;
+                }
                 break status;
             }
             terminal => break terminal,
@@ -86,9 +89,10 @@ struct OwnedReport {
 mod tests {
     use super::*;
     use accelerator_node_lifecycle::{
-        AcceleratorProfile, JsonFileStore, NextAction, NodeActionExecutor, ProfileApplyResult, TransitionPhase,
+        AcceleratorProfile, JsonFileStore, NextAction, NodeActionExecutor, ProfileApplyResult,
+        TransitionPhase,
     };
-    use std::io;
+    use std::{fs, io};
     use tempfile::TempDir;
 
     #[derive(Default)]
@@ -195,7 +199,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report.completed_actions, vec![NodeAction::WithdrawAdvertisement]);
+        assert_eq!(
+            report.completed_actions,
+            vec![NodeAction::WithdrawAdvertisement]
+        );
         assert_eq!(
             report.status,
             ResumeStatus::RebootRequired {
@@ -206,6 +213,43 @@ mod tests {
         assert_eq!(
             persisted.phase(),
             Some(TransitionPhase::TargetProfileRebootRequired)
+        );
+    }
+
+    #[test]
+    fn repeated_reboot_requirement_does_not_retrigger_the_notification() {
+        let directory = TempDir::new().unwrap();
+        let state_path = directory.path().join("state.json");
+        node_drained_state(&state_path);
+        let mut executor = FakeExecutor {
+            reboot_required: true,
+            ..Default::default()
+        };
+
+        execute(
+            Args {
+                state_path: state_path.clone(),
+            },
+            &mut executor,
+        )
+        .unwrap();
+
+        let store = JsonFileStore::new(&state_path);
+        fs::write(store.notification_path(), "notification-sentinel").unwrap();
+        executor.actions.clear();
+
+        let report = execute(Args { state_path }, &mut executor).unwrap();
+
+        assert_eq!(report.completed_actions, Vec::<NodeAction>::new());
+        assert_eq!(
+            report.status,
+            ResumeStatus::RebootRequired {
+                action: NodeAction::ApplyProfile(AcceleratorProfile::SharedInference),
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(store.notification_path()).unwrap(),
+            "notification-sentinel"
         );
     }
 
