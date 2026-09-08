@@ -1,4 +1,4 @@
-From bfa0161a473887160063e9abb9d9bf2b00e5864c Mon Sep 17 00:00:00 2001
+From 3ed345b017c90290cddf5e8996eafae6aa858689 Mon Sep 17 00:00:00 2001
 From: Radu Constantinescu <rdu@amazon.com>
 Date: Tue, 8 Sep 2026 15:41:01 +0000
 Subject: [PATCH] fs, internal/http: add custom HTTP request headers via
@@ -26,18 +26,18 @@ Signed-off-by: Radu Constantinescu <rdu@amazon.com>
 ---
  fs/fs.go                      |   7 ++
  fs/remote/resolver.go         |  18 ++-
- fs/remote/resolver_test.go    | 206 ++++++++++++++++++++++++++++++++++
+ fs/remote/resolver_test.go    | 207 ++++++++++++++++++++++++++++++++++
  fs/source/source.go           |  46 ++++++++
  fs/source/source_test.go      | 139 +++++++++++++++++++++++
  go.mod                        |   2 +-
  internal/http/auth.go         |   7 ++
  internal/http/headers.go      |  40 +++++++
  internal/http/headers_test.go | 155 +++++++++++++++++++++++++
- 9 files changed, 614 insertions(+), 6 deletions(-)
+ 9 files changed, 615 insertions(+), 6 deletions(-)
  create mode 100644 internal/http/headers_test.go
 
 diff --git a/fs/fs.go b/fs/fs.go
-index fb4fb1b1c..66dec54fd 100644
+index fb4fb1b..66dec54 100644
 --- a/fs/fs.go
 +++ b/fs/fs.go
 @@ -476,6 +476,8 @@ func (fs *filesystem) MountParallel(ctx context.Context, mountpoint string, labe
@@ -83,7 +83,7 @@ index fb4fb1b1c..66dec54fd 100644
  			prefetchDesc := c.findPrefetchArtifact(desc.Digest.String())
  
 diff --git a/fs/remote/resolver.go b/fs/remote/resolver.go
-index 03d4541b6..fb39bce49 100644
+index 03d4541..fb39bce 100644
 --- a/fs/remote/resolver.go
 +++ b/fs/remote/resolver.go
 @@ -181,6 +181,10 @@ type httpFetcher struct {
@@ -140,10 +140,10 @@ index 03d4541b6..fb39bce49 100644
  	if err != nil {
  		return err
 diff --git a/fs/remote/resolver_test.go b/fs/remote/resolver_test.go
-index c69c89e0b..5a69b85a2 100644
+index beeb656..7fe94c5 100644
 --- a/fs/remote/resolver_test.go
 +++ b/fs/remote/resolver_test.go
-@@ -44,10 +44,12 @@ import (
+@@ -44,11 +44,14 @@ import (
  	"fmt"
  	"io"
  	"net/http"
@@ -154,9 +154,11 @@ index c69c89e0b..5a69b85a2 100644
  	"strings"
 +	"sync"
  	"testing"
- 	"time"
++	"time"
  
-@@ -402,6 +404,210 @@ func (u *userAgentRoundTripper) RoundTrip(req *http.Request) (*http.Response, er
+ 	socihttp "github.com/awslabs/soci-snapshotter/internal/http"
+ 	"github.com/awslabs/soci-snapshotter/version"
+@@ -399,6 +402,210 @@ func (u *userAgentRoundTripper) RoundTrip(req *http.Request) (*http.Response, er
  	}, nil
  }
  
@@ -368,7 +370,7 @@ index c69c89e0b..5a69b85a2 100644
  	tc := []struct {
  		name         string
 diff --git a/fs/source/source.go b/fs/source/source.go
-index 261a2fa42..d79a08524 100644
+index 261a2fa..d79a085 100644
 --- a/fs/source/source.go
 +++ b/fs/source/source.go
 @@ -35,16 +35,20 @@ package source
@@ -444,7 +446,7 @@ index 261a2fa42..d79a08524 100644
  // to reduce package dependency
  type RegistryHosts func(imgRefSpec reference.Spec) ([]docker.RegistryHost, error)
 diff --git a/fs/source/source_test.go b/fs/source/source_test.go
-index af93bceda..952d15ecb 100644
+index af93bce..952d15e 100644
 --- a/fs/source/source_test.go
 +++ b/fs/source/source_test.go
 @@ -17,11 +17,15 @@
@@ -603,7 +605,7 @@ index af93bceda..952d15ecb 100644
 +	return warned
 +}
 diff --git a/go.mod b/go.mod
-index 221aed41d..8ae1d3d90 100644
+index 91d391e..0d70004 100644
 --- a/go.mod
 +++ b/go.mod
 @@ -33,6 +33,7 @@ require (
@@ -623,7 +625,7 @@ index 221aed41d..8ae1d3d90 100644
  	golang.org/x/term v0.45.0 // indirect
  	golang.org/x/text v0.40.0 // indirect
 diff --git a/internal/http/auth.go b/internal/http/auth.go
-index 65e2b1754..79e2e85c6 100644
+index 65e2b17..79e2e85 100644
 --- a/internal/http/auth.go
 +++ b/internal/http/auth.go
 @@ -145,6 +145,13 @@ func (ac *AuthClient) Do(req *http.Request) (*http.Response, error) {
@@ -641,7 +643,7 @@ index 65e2b1754..79e2e85c6 100644
  		if err != nil {
  			return nil, fmt.Errorf("%w: %w", ErrFailedToAuthorizeRequest, err)
 diff --git a/internal/http/headers.go b/internal/http/headers.go
-index d04acc8b3..ededf207d 100644
+index d04acc8..ededf20 100644
 --- a/internal/http/headers.go
 +++ b/internal/http/headers.go
 @@ -16,6 +16,11 @@
@@ -697,7 +699,7 @@ index d04acc8b3..ededf207d 100644
 +}
 diff --git a/internal/http/headers_test.go b/internal/http/headers_test.go
 new file mode 100644
-index 000000000..bd0f0f731
+index 0000000..bd0f0f7
 --- /dev/null
 +++ b/internal/http/headers_test.go
 @@ -0,0 +1,155 @@
@@ -856,3 +858,6 @@ index 000000000..bd0f0f731
 +		t.Fatal(err)
 +	}
 +}
+-- 
+2.50.1
+
