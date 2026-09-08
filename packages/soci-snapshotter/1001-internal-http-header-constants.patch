@@ -1,0 +1,148 @@
+From 99dee8e8facd167fc2c640bf088775d77ac1b3f2 Mon Sep 17 00:00:00 2001
+From: Radu Constantinescu <rdu@amazon.com>
+Date: Tue, 8 Sep 2026 13:28:28 +0000
+Subject: [PATCH] internal/http: introduce shared header-name constants
+
+Replace the string literals for the HTTP headers the snapshotter and its
+libraries set (Range, Accept-Encoding, User-Agent, Referer) with named
+constants in internal/http. This is a behavior-neutral refactor. It gives a
+single source of truth for these names, which a later change reuses to build
+the set of headers a caller must not override.
+
+Signed-off-by: Radu Constantinescu <rdu@amazon.com>
+---
+ fs/artifact_fetcher.go     |  2 +-
+ fs/remote/resolver.go      | 12 ++++++------
+ internal/http/auth.go      |  2 +-
+ internal/http/headers.go   | 31 +++++++++++++++++++++++++++++++
+ service/resolver/client.go |  2 +-
+ 5 files changed, 40 insertions(+), 9 deletions(-)
+ create mode 100644 internal/http/headers.go
+
+diff --git a/fs/artifact_fetcher.go b/fs/artifact_fetcher.go
+index 358abf9a5..d61ff3d0f 100644
+--- a/fs/artifact_fetcher.go
++++ b/fs/artifact_fetcher.go
+@@ -143,7 +143,7 @@ func GetContentWithRange(ctx context.Context, realURL string, rt http.RoundTripp
+ 		return nil, err
+ 	}
+ 	r := fmt.Sprintf("bytes=%d-%d", lower, upper)
+-	req.Header.Set("Range", r)
++	req.Header.Set(socihttp.HeaderRange, r)
+ 
+ 	resp, err := rt.RoundTrip(req)
+ 	if err != nil {
+diff --git a/fs/remote/resolver.go b/fs/remote/resolver.go
+index 62463e81d..03d4541b6 100644
+--- a/fs/remote/resolver.go
++++ b/fs/remote/resolver.go
+@@ -308,8 +308,8 @@ func (f *httpFetcher) fetch(ctx context.Context, rs []region, retry bool) (multi
+ 	for _, reg := range requests {
+ 		ranges += fmt.Sprintf("%d-%d,", reg.b, reg.e)
+ 	}
+-	req.Header.Add("Range", fmt.Sprintf("bytes=%s", ranges[:len(ranges)-1]))
+-	req.Header.Add("Accept-Encoding", "identity")
++	req.Header.Add(socihttp.HeaderRange, fmt.Sprintf("bytes=%s", ranges[:len(ranges)-1]))
++	req.Header.Add(socihttp.HeaderAcceptEncoding, "identity")
+ 
+ 	// Recording the roundtrip latency for remote registry GET operation.
+ 	start := time.Now()
+@@ -380,7 +380,7 @@ func (f *httpFetcher) check() error {
+ 	if err != nil {
+ 		return fmt.Errorf("check failed: %w", err)
+ 	}
+-	req.Header.Set("Range", "bytes=0-1")
++	req.Header.Set(socihttp.HeaderRange, "bytes=0-1")
+ 	res, err := f.roundTripper.RoundTrip(req)
+ 	if err != nil {
+ 		return fmt.Errorf("check failed: %w: %w", ErrRequestFailed, err)
+@@ -441,7 +441,7 @@ func redirect(ctx context.Context, blobURL string, tr http.RoundTripper) (string
+ 	if err != nil {
+ 		return "", err
+ 	}
+-	req.Header.Set("Range", "bytes=0-1")
++	req.Header.Set(socihttp.HeaderRange, "bytes=0-1")
+ 
+ 	// The underlying http.Client will follow up to 10 redirects.
+ 	// See: https://pkg.go.dev/net/http#Get
+@@ -496,7 +496,7 @@ func GetHeader(ctx context.Context, realURL string, rt http.RoundTripper) (*http
+ 			return nil, err
+ 		}
+ 		if i == 1 {
+-			req.Header.Set("Range", "bytes=0-1")
++			req.Header.Set(socihttp.HeaderRange, "bytes=0-1")
+ 		}
+ 
+ 		resp, err := rt.RoundTrip(req)
+@@ -526,7 +526,7 @@ func GetHeaderWithGet(ctx context.Context, realURL string, rt http.RoundTripper)
+ 			return nil, err
+ 		}
+ 		if i == 0 {
+-			req.Header.Set("Range", "bytes=0-1")
++			req.Header.Set(socihttp.HeaderRange, "bytes=0-1")
+ 		}
+ 
+ 		resp, err := rt.RoundTrip(req)
+diff --git a/internal/http/auth.go b/internal/http/auth.go
+index 806da1c35..65e2b1754 100644
+--- a/internal/http/auth.go
++++ b/internal/http/auth.go
+@@ -257,7 +257,7 @@ func (ac *AuthClient) redirected(req *http.Request) *http.Request {
+ 		return nil
+ 	}
+ 	r := req.Clone(ac.getAuthCtx(req.Context()))
+-	r.Header.Set("Referer", req.URL.String())
++	r.Header.Set(HeaderReferer, req.URL.String())
+ 	r.URL = newURL
+ 	r.Host = newURL.Host
+ 	return r
+diff --git a/internal/http/headers.go b/internal/http/headers.go
+new file mode 100644
+index 000000000..d04acc8b3
+--- /dev/null
++++ b/internal/http/headers.go
+@@ -0,0 +1,31 @@
++/*
++   Copyright The Soci Snapshotter Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package http
++
++// These constants name the HTTP headers that the snapshotter or a shared library
++// sets on its own requests. A caller must not override them through a custom
++// header. ReservedHeaders lists them.
++const (
++	HeaderRange          = "Range"
++	HeaderAcceptEncoding = "Accept-Encoding"
++	HeaderAccept         = "Accept"
++	HeaderContentType    = "Content-Type"
++	HeaderContentLength  = "Content-Length"
++	HeaderAuthorization  = "Authorization"
++	HeaderUserAgent      = "User-Agent"
++	HeaderReferer        = "Referer"
++)
+diff --git a/service/resolver/client.go b/service/resolver/client.go
+index af0c9a442..7f096ebf8 100644
+--- a/service/resolver/client.go
++++ b/service/resolver/client.go
+@@ -46,7 +46,7 @@ var userAgent = fmt.Sprintf("soci-snapshotter/%s", version.Version)
+ // to all requests.
+ func globalHeaders() http.Header {
+ 	header := http.Header{}
+-	header.Set("User-Agent", userAgent)
++	header.Set(socihttp.HeaderUserAgent, userAgent)
+ 	return header
+ }
+ 

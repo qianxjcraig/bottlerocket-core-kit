@@ -1,11 +1,11 @@
 %global gorepo soci-snapshotter
 %global gover 0.15.0
 %global rpmver %{gover}
-%global gitrev 7716bd67e813f8e80873948e0a02d0a7c5370854
+%global gitrev bfa0161a473887160063e9abb9d9bf2b00e5864c
 
 Name: %{_cross_os}soci-snapshotter
 Version: %{gover}
-Release: 1%{?dist}
+Release: 2%{?dist}
 Epoch: 1
 Summary: A containerd snapshotter plugin which enables lazy loading for OCI images.
 License: Apache-2.0
@@ -20,6 +20,9 @@ Source100: etc-soci-snapshotter.mount.in
 Source101: soci-snapshotter.service
 Source102: soci-snapshotter.socket
 Source1000: clarify.toml
+
+Patch1001: 1001-internal-http-header-constants.patch
+Patch1002: 1002-custom-http-headers-from-labels.patch
 
 BuildRequires: %{_cross_os}glibc-devel
 BuildRequires: %{_cross_os}libz-devel

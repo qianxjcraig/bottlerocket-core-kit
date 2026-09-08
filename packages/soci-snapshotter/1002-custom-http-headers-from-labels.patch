@@ -1,0 +1,858 @@
+From bfa0161a473887160063e9abb9d9bf2b00e5864c Mon Sep 17 00:00:00 2001
+From: Radu Constantinescu <rdu@amazon.com>
+Date: Tue, 8 Sep 2026 15:41:01 +0000
+Subject: [PATCH] fs, internal/http: add custom HTTP request headers via
+ snapshot labels
+
+A snapshot label containerd.io/snapshot/remote/soci.header.<name> = <value>
+adds the header <name>: <value> to the registry requests the snapshotter
+makes. Callers can use this to identify or correlate their requests.
+
+source.HeadersFromLabels reads the labels. fs.fs puts the headers on the
+context at each mount entry point (Mount, MountParallel, MountLocal), in the
+neighboring-layer pre-resolution loop, and in preloadAllLayers. Each
+httpFetcher captures them once at creation and re-attaches them on fetch,
+check, and refreshURL. AuthClient.Do sets them on the outgoing request, so
+layer, index, and zTOC fetches all carry them.
+
+Names and values are validated with golang.org/x/net/http/httpguts. The value
+check rejects CR and LF, so a label cannot inject a second header or split the
+request. Reserved headers set by the snapshotter or a shared library (Range,
+Accept-Encoding, Accept, Content-Type, Content-Length, Authorization,
+User-Agent, Referer) are dropped with a WARN at both the parser and the sink.
+An invalid or reserved label never fails the mount.
+
+Signed-off-by: Radu Constantinescu <rdu@amazon.com>
+---
+ fs/fs.go                      |   7 ++
+ fs/remote/resolver.go         |  18 ++-
+ fs/remote/resolver_test.go    | 206 ++++++++++++++++++++++++++++++++++
+ fs/source/source.go           |  46 ++++++++
+ fs/source/source_test.go      | 139 +++++++++++++++++++++++
+ go.mod                        |   2 +-
+ internal/http/auth.go         |   7 ++
+ internal/http/headers.go      |  40 +++++++
+ internal/http/headers_test.go | 155 +++++++++++++++++++++++++
+ 9 files changed, 614 insertions(+), 6 deletions(-)
+ create mode 100644 internal/http/headers_test.go
+
+diff --git a/fs/fs.go b/fs/fs.go
+index fb4fb1b1c..66dec54fd 100644
+--- a/fs/fs.go
++++ b/fs/fs.go
+@@ -476,6 +476,8 @@ func (fs *filesystem) MountParallel(ctx context.Context, mountpoint string, labe
+ 		return ErrParallelPullIsDisabled
+ 	}
+ 
++	ctx = socihttp.WithCustomHeaders(ctx, source.HeadersFromLabels(ctx, labels))
++
+ 	imageRef, ok := labels[ctdsnapshotters.TargetRefLabel]
+ 	if !ok {
+ 		return fmt.Errorf("unable to get image ref from labels")
+@@ -552,6 +554,7 @@ func (fs *filesystem) preloadAllLayers(ctx context.Context, desc ocispec.Descrip
+ 
+ 	premountCtx, cancel := context.WithCancelCause(context.Background())
+ 	premountCtx = namespaces.WithNamespace(premountCtx, ns)
++	premountCtx = socihttp.WithCustomHeaders(premountCtx, socihttp.CustomHeaders(ctx))
+ 	imageJob := fs.inProgressImageUnpacks.GetOrAddImageJob(imageDigest, cancel)
+ 
+ 	// If we fail anywhere after making the image job, we must remove the associated image job
+@@ -781,6 +784,8 @@ func (fs *filesystem) CleanImage(ctx context.Context, imgDigest string) error {
+ }
+ 
+ func (fs *filesystem) MountLocal(ctx context.Context, mountpoint string, labels map[string]string, mounts []mount.Mount) error {
++	ctx = socihttp.WithCustomHeaders(ctx, source.HeadersFromLabels(ctx, labels))
++
+ 	imageRef, ok := labels[ctdsnapshotters.TargetRefLabel]
+ 	if !ok {
+ 		return fmt.Errorf("unable to get image ref from labels")
+@@ -1039,6 +1044,7 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
+ 	// Setting the start time to measure the Mount operation duration.
+ 	start := time.Now()
+ 	ctx = log.WithLogger(ctx, log.G(ctx).WithField("mountpoint", mountpoint))
++	ctx = socihttp.WithCustomHeaders(ctx, source.HeadersFromLabels(ctx, labels))
+ 
+ 	// If this is empty or the label doesn't exist, then we will use the referrers API later
+ 	// to get find an index digest.
+@@ -1129,6 +1135,7 @@ func (fs *filesystem) Mount(ctx context.Context, mountpoint string, labels map[s
+ 		fs.pr.Enqueue(imgNameAndDigest, func(ctx context.Context) string {
+ 			// Use context from the preresolver, but append namespace from current ctx
+ 			ctx = namespaces.WithNamespace(ctx, ns)
++			ctx = socihttp.WithCustomHeaders(ctx, source.HeadersFromLabels(ctx, labels))
+ 
+ 			prefetchDesc := c.findPrefetchArtifact(desc.Digest.String())
+ 
+diff --git a/fs/remote/resolver.go b/fs/remote/resolver.go
+index 03d4541b6..fb39bce49 100644
+--- a/fs/remote/resolver.go
++++ b/fs/remote/resolver.go
+@@ -181,6 +181,10 @@ type httpFetcher struct {
+ 	digest        digest.Digest
+ 	singleRange   bool
+ 	singleRangeMu sync.Mutex
++	// customHeaders is added to every request this fetcher makes, including
++	// background, liveness, and post-redirect fetches (e.g. to a CDN or object
++	// store). Reserved headers are never forwarded (see socihttp.ReservedHeaders).
++	customHeaders http.Header
+ }
+ 
+ func newHTTPFetcher(ctx context.Context, fc *fetcherConfig) (*httpFetcher, error) {
+@@ -263,11 +267,12 @@ func newHTTPFetcher(ctx context.Context, fc *fetcherConfig) (*httpFetcher, error
+ 
+ 		// Hit one destination
+ 		return &httpFetcher{
+-			roundTripper: tr,
+-			scope:        pullScope,
+-			registryURL:  registryURL,
+-			realURL:      realURL,
+-			digest:       digest,
++			roundTripper:  tr,
++			scope:         pullScope,
++			registryURL:   registryURL,
++			realURL:       realURL,
++			digest:        digest,
++			customHeaders: socihttp.CustomHeaders(ctx),
+ 		}, nil
+ 	}
+ 
+@@ -276,6 +281,7 @@ func newHTTPFetcher(ctx context.Context, fc *fetcherConfig) (*httpFetcher, error
+ 
+ func (f *httpFetcher) fetch(ctx context.Context, rs []region, retry bool) (multipartReadCloser, error) {
+ 	ctx = docker.WithScope(ctx, f.scope)
++	ctx = socihttp.WithCustomHeaders(ctx, f.customHeaders)
+ 	if len(rs) == 0 {
+ 		return nil, ErrNoRegion
+ 	}
+@@ -373,6 +379,7 @@ func (f *httpFetcher) fetch(ctx context.Context, rs []region, retry bool) (multi
+ func (f *httpFetcher) check() error {
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	defer cancel()
++	ctx = socihttp.WithCustomHeaders(ctx, f.customHeaders)
+ 	f.urlMu.Lock()
+ 	url := f.realURL
+ 	f.urlMu.Unlock()
+@@ -403,6 +410,7 @@ func (f *httpFetcher) check() error {
+ }
+ 
+ func (f *httpFetcher) refreshURL(ctx context.Context) error {
++	ctx = socihttp.WithCustomHeaders(ctx, f.customHeaders)
+ 	newRealURL, err := redirect(ctx, f.registryURL, f.roundTripper)
+ 	if err != nil {
+ 		return err
+diff --git a/fs/remote/resolver_test.go b/fs/remote/resolver_test.go
+index c69c89e0b..5a69b85a2 100644
+--- a/fs/remote/resolver_test.go
++++ b/fs/remote/resolver_test.go
+@@ -44,10 +44,12 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
++	"net/http/httptest"
+ 	"net/url"
+ 	"path/filepath"
+ 	"regexp"
+ 	"strings"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -402,6 +404,210 @@ func (u *userAgentRoundTripper) RoundTrip(req *http.Request) (*http.Response, er
+ 	}, nil
+ }
+ 
++// headerCaptureRoundTripper records the headers of the request it sees.
++type headerCaptureRoundTripper struct{ got http.Header }
++
++func (h *headerCaptureRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
++	h.got = req.Header.Clone()
++	header := make(http.Header)
++	header.Add("Content-Length", "4")
++	return &http.Response{
++		StatusCode: http.StatusOK,
++		Request:    req,
++		Header:     header,
++		Body:       io.NopCloser(bytes.NewReader([]byte("test"))),
++	}, nil
++}
++
++// newTestAuthClient wraps rt in an AuthClient
++func newTestAuthClient(rt http.RoundTripper) *socihttp.AuthClient {
++	retryClient := rhttp.NewClient()
++	retryClient.HTTPClient.Transport = rt
++	ac, _ := socihttp.NewAuthClient(&emptyAuthHandler{}, socihttp.WithRetryableClient(retryClient), socihttp.WithHeader(http.Header{}))
++	return ac
++}
++
++// TestCustomHeaderReachesWireOnFetch proves a custom header stored on the fetcher
++// reaches the outgoing request, and that a reserved custom header does not
++// override the byte-range the fetcher sets itself.
++func TestCustomHeaderReachesWireOnFetch(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	custom := http.Header{}
++	custom.Set("x-request-id", "caller-123")
++	custom.Set(socihttp.HeaderRange, "bytes=999-999") // reserved: must be ignored
++
++	rt := &headerCaptureRoundTripper{}
++	f := &httpFetcher{
++		realURL:       "dummyregistry",
++		roundTripper:  newTestAuthClient(rt),
++		customHeaders: custom,
++	}
++	if _, err := f.fetch(ctx, []region{{b: 0, e: 1}}, true); err != nil {
++		t.Fatalf("unexpected error = %v", err)
++	}
++	if got := rt.got.Get("x-request-id"); got != "caller-123" {
++		t.Fatalf("custom header not on the wire: got %q", got)
++	}
++	if got := rt.got.Get(socihttp.HeaderRange); got != "bytes=0-1" {
++		t.Fatalf("reserved custom Range overrode the fetcher's own range: got %q", got)
++	}
++}
++
++func TestMultipleCustomHeadersReachWireOnFetch(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	custom := http.Header{}
++	custom.Set("x-request-id", "caller-123")
++	custom.Set("x-tenant-id", "tenant-7")
++	custom.Set("x-trace", "trace-abc")
++	custom.Set(socihttp.HeaderAuthorization, "Basic zzz") // reserved: must be dropped
++
++	rt := &headerCaptureRoundTripper{}
++	f := &httpFetcher{
++		realURL:       "dummyregistry",
++		roundTripper:  newTestAuthClient(rt),
++		customHeaders: custom,
++	}
++	if _, err := f.fetch(ctx, []region{{b: 0, e: 1}}, true); err != nil {
++		t.Fatalf("unexpected error = %v", err)
++	}
++	want := map[string]string{
++		"x-request-id": "caller-123",
++		"x-tenant-id":  "tenant-7",
++		"x-trace":      "trace-abc",
++	}
++	for name, val := range want {
++		if got := rt.got.Get(name); got != val {
++			t.Fatalf("custom header %q not on the wire: got %q, want %q", name, got, val)
++		}
++	}
++	if got := rt.got.Get(socihttp.HeaderAuthorization); got != "" {
++		t.Fatalf("reserved Authorization must be dropped: got %q", got)
++	}
++}
++
++func TestCustomHeaderSurvivesCheck(t *testing.T) {
++	custom := http.Header{}
++	custom.Set("x-request-id", "caller-123")
++
++	rt := &headerCaptureRoundTripper{}
++	f := &httpFetcher{
++		realURL:       "dummyregistry",
++		roundTripper:  newTestAuthClient(rt),
++		customHeaders: custom,
++	}
++	if err := f.check(); err != nil {
++		t.Fatalf("check failed: %v", err)
++	}
++	if got := rt.got.Get("x-request-id"); got != "caller-123" {
++		t.Fatalf("custom header lost on check(): got %q", got)
++	}
++}
++
++func TestCustomHeaderCapturedFromContext(t *testing.T) {
++	refspec, err := reference.Parse("dummyexample.com/library/test")
++	if err != nil {
++		t.Fatalf("failed to parse reference: %v", err)
++	}
++	blobDigest := digest.FromString("dummy")
++
++	custom := http.Header{}
++	custom.Set("x-request-id", "caller-123")
++	ctx := socihttp.WithCustomHeaders(context.Background(), custom)
++
++	rt := &headerCaptureRoundTripper{}
++	hosts := []docker.RegistryHost{{
++		Client:       &http.Client{Transport: newTestAuthClient(rt)},
++		Host:         refspec.Hostname(),
++		Scheme:       "https",
++		Path:         "/v2",
++		Capabilities: docker.HostCapabilityPull,
++	}}
++
++	f, err := newHTTPFetcher(ctx, &fetcherConfig{
++		hosts:   hosts,
++		refspec: refspec,
++		desc:    ocispec.Descriptor{Digest: blobDigest, Size: 1},
++	})
++	if err != nil {
++		t.Fatalf("newHTTPFetcher: %v", err)
++	}
++	if _, err := f.fetch(context.Background(), []region{{b: 0, e: 1}}, true); err != nil {
++		t.Fatalf("fetch: %v", err)
++	}
++	if got := rt.got.Get("x-request-id"); got != "caller-123" {
++		t.Fatalf("header not captured from context and sent on the wire: got %q", got)
++	}
++}
++
++func TestCustomHeaderOverRealServer(t *testing.T) {
++	var mu sync.Mutex
++	var seen []string
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		mu.Lock()
++		seen = append(seen, r.Header.Get("x-request-id"))
++		mu.Unlock()
++		w.Header().Set("Content-Length", "4")
++		w.WriteHeader(http.StatusOK)
++		_, _ = w.Write([]byte("test"))
++	}))
++	defer srv.Close()
++
++	u, err := url.Parse(srv.URL)
++	if err != nil {
++		t.Fatalf("parse server url: %v", err)
++	}
++	refspec, err := reference.Parse(u.Host + "/repo:tag")
++	if err != nil {
++		t.Fatalf("parse ref: %v", err)
++	}
++
++	// Seed the header exactly as source.HeadersFromLabels would from the
++	// soci.header.x-request-id label.
++	custom := http.Header{}
++	custom.Set("x-request-id", "caller-xyz")
++	ctx := socihttp.WithCustomHeaders(context.Background(), custom)
++
++	// A real AuthClient over the real default transport — no mock anywhere.
++	retryClient := rhttp.NewClient()
++	retryClient.Logger = nil
++	ac, _ := socihttp.NewAuthClient(&emptyAuthHandler{}, socihttp.WithRetryableClient(retryClient), socihttp.WithHeader(http.Header{}))
++	host := docker.RegistryHost{
++		Client:       &http.Client{Transport: ac},
++		Host:         u.Host,
++		Scheme:       "http",
++		Path:         "/v2",
++		Capabilities: docker.HostCapabilityPull,
++	}
++
++	f, err := newHTTPFetcher(ctx, &fetcherConfig{
++		hosts:   []docker.RegistryHost{host},
++		refspec: refspec,
++		desc:    ocispec.Descriptor{Digest: digest.FromString("dummy"), Size: 1},
++	})
++	if err != nil {
++		t.Fatalf("newHTTPFetcher: %v", err)
++	}
++	if _, err := f.fetch(ctx, []region{{b: 0, e: 1}}, true); err != nil {
++		t.Fatalf("fetch: %v", err)
++	}
++
++	mu.Lock()
++	defer mu.Unlock()
++	if len(seen) == 0 {
++		t.Fatal("server received no requests")
++	}
++	for i, id := range seen {
++		if id != "caller-xyz" {
++			t.Fatalf("request %d reached the server WITHOUT x-request-id: got %q", i, id)
++		}
++	}
++	t.Logf("real server saw x-request-id=%q on all %d byte-range requests", "caller-xyz", len(seen))
++}
++
+ func TestParseSize(t *testing.T) {
+ 	tc := []struct {
+ 		name         string
+diff --git a/fs/source/source.go b/fs/source/source.go
+index 261a2fa42..d79a08524 100644
+--- a/fs/source/source.go
++++ b/fs/source/source.go
+@@ -35,16 +35,20 @@ package source
+ import (
+ 	"context"
+ 	"fmt"
++	"net/http"
+ 	"strconv"
+ 	"strings"
+ 
++	socihttp "github.com/awslabs/soci-snapshotter/internal/http"
+ 	"github.com/containerd/containerd/v2/core/images"
+ 	"github.com/containerd/containerd/v2/core/remotes/docker"
+ 	"github.com/containerd/containerd/v2/pkg/labels"
+ 	"github.com/containerd/containerd/v2/pkg/reference"
+ 	ctdsnapshotters "github.com/containerd/containerd/v2/pkg/snapshotters"
++	"github.com/containerd/log"
+ 	digest "github.com/opencontainers/go-digest"
+ 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
++	"golang.org/x/net/http/httpguts"
+ )
+ 
+ // GetSources is a function for converting snapshot labels into typed blob sources
+@@ -90,8 +94,50 @@ const (
+ 
+ 	// HasSociIndexDigest is a label that tells if the layer was pulled with a SOCI index.
+ 	HasSociIndexDigest = "containerd.io/snapshot/remote/has.soci.index.digest"
++
++	// CustomHeaderLabelPrefix marks a snapshot label that carries a custom HTTP
++	// header for the snapshotter's registry requests. The header name is the label
++	// key after the prefix. The header value is the label value. For example:
++	//	containerd.io/snapshot/remote/soci.header.x-request-id = "<value>"
++	CustomHeaderLabelPrefix = "containerd.io/snapshot/remote/soci.header."
+ )
+ 
++// HeadersFromLabels returns the custom headers from the CustomHeaderLabelPrefix
++// labels. It uses each label's suffix as the header name.
++//
++// HeadersFromLabels skips a label and logs a warning when:
++//   - the header name is reserved (see [socihttp.ReservedHeaders]), or
++//   - the name or value is not a valid HTTP header field.
++//
++// A skipped label never fails the mount. The value check rejects CR and LF, so a
++// label cannot inject a second header or split the request.
++func HeadersFromLabels(ctx context.Context, labels map[string]string) http.Header {
++	h := http.Header{}
++	for k, v := range labels {
++		if v == "" {
++			continue
++		}
++		name := strings.TrimPrefix(k, CustomHeaderLabelPrefix)
++		if name == k || name == "" {
++			continue
++		}
++		if _, ok := socihttp.ReservedHeaders[http.CanonicalHeaderKey(name)]; ok {
++			log.G(ctx).WithField("header", name).Warn("ignoring reserved custom header from snapshot label")
++			continue
++		}
++		if !httpguts.ValidHeaderFieldName(name) {
++			log.G(ctx).WithField("header", name).Warn("ignoring custom header with an invalid name from snapshot label")
++			continue
++		}
++		if !httpguts.ValidHeaderFieldValue(v) {
++			log.G(ctx).WithField("header", name).Warn("ignoring custom header with an invalid value from snapshot label")
++			continue
++		}
++		h.Set(name, v)
++	}
++	return h
++}
++
+ // RegistryHosts is copied from [github.com/awslabs/soci-snapshotter/service/resolver.RegistryHosts]
+ // to reduce package dependency
+ type RegistryHosts func(imgRefSpec reference.Spec) ([]docker.RegistryHost, error)
+diff --git a/fs/source/source_test.go b/fs/source/source_test.go
+index af93bceda..952d15ecb 100644
+--- a/fs/source/source_test.go
++++ b/fs/source/source_test.go
+@@ -17,11 +17,15 @@
+ package source
+ 
+ import (
++	"context"
+ 	"testing"
+ 
+ 	"github.com/containerd/containerd/v2/core/remotes/docker"
+ 	"github.com/containerd/containerd/v2/pkg/reference"
+ 	ctdsnapshotters "github.com/containerd/containerd/v2/pkg/snapshotters"
++	"github.com/containerd/log"
++	"github.com/sirupsen/logrus"
++	logrustest "github.com/sirupsen/logrus/hooks/test"
+ )
+ 
+ const (
+@@ -112,3 +116,138 @@ func TestNeighboringLayersSizeLengthMismatch(t *testing.T) {
+ 		t.Fatal("expected error on digest/size length mismatch, got nil")
+ 	}
+ }
++
++// TestHeadersFromLabels verifies the generic prefix convention: any label keyed
++// soci.header.<name> becomes header <name>, the snapshotter forwards it verbatim,
++// and non-matching, empty, or reserved labels are ignored.
++func TestHeadersFromLabels(t *testing.T) {
++	labels := map[string]string{
++		CustomHeaderLabelPrefix + "x-request-id":   "caller-123",
++		CustomHeaderLabelPrefix + "x-custom-trace": "trace-abc",
++		CustomHeaderLabelPrefix + "x-empty":        "",          // dropped: empty value
++		CustomHeaderLabelPrefix:                    "no-name",   // dropped: no header name
++		CustomHeaderLabelPrefix + "Authorization":  "Basic abc", // dropped: reserved
++		CustomHeaderLabelPrefix + "range":          "bytes=0-1", // dropped: reserved (any case)
++		"containerd.io/snapshot/remote/soci.size":  "4096",      // dropped: not a header label
++		"unrelated": "nope",
++	}
++
++	h := HeadersFromLabels(context.Background(), labels)
++
++	if got := h.Get("x-request-id"); got != "caller-123" {
++		t.Fatalf("x-request-id = %q, want %q", got, "caller-123")
++	}
++	if got := h.Get("x-custom-trace"); got != "trace-abc" {
++		t.Fatalf("x-custom-trace = %q, want %q", got, "trace-abc")
++	}
++	if _, ok := h["X-Empty"]; ok {
++		t.Fatalf("empty-valued header label should be dropped, got %v", h["X-Empty"])
++	}
++	if got := h.Get("Authorization"); got != "" {
++		t.Fatalf("reserved header Authorization should be dropped, got %q", got)
++	}
++	if got := h.Get("Range"); got != "" {
++		t.Fatalf("reserved header Range should be dropped, got %q", got)
++	}
++	// Only the two valid headers should be present.
++	if len(h) != 2 {
++		t.Fatalf("expected exactly 2 headers, got %d: %v", len(h), h)
++	}
++}
++
++func TestHeadersFromLabels_None(t *testing.T) {
++	if h := HeadersFromLabels(context.Background(), map[string]string{"foo": "bar"}); len(h) != 0 {
++		t.Fatalf("expected no headers, got %v", h)
++	}
++}
++
++// TestHeadersFromLabels_InvalidDropped verifies a label with an invalid header
++// name or a CR/LF in the value is dropped, so a label cannot inject a header.
++func TestHeadersFromLabels_InvalidDropped(t *testing.T) {
++	ctx, hook := ctxWithLogHook()
++
++	invalid := []string{"x with space", "x@bad", "x-inject", "x-null"}
++	labels := map[string]string{
++		CustomHeaderLabelPrefix + "x with space": "v",              // invalid name: space
++		CustomHeaderLabelPrefix + "x@bad":        "v",              // invalid name: non-token
++		CustomHeaderLabelPrefix + "x-inject":     "v\r\nX-Evil: 1", // invalid value: CRLF
++		CustomHeaderLabelPrefix + "x-null":       "a\x00b",         // invalid value: NUL
++		CustomHeaderLabelPrefix + "x-request-id": "caller-123",     // valid: kept
++	}
++
++	h := HeadersFromLabels(ctx, labels)
++
++	if got := h.Get("x-request-id"); got != "caller-123" {
++		t.Fatalf("valid header dropped: got %q", got)
++	}
++	if len(h) != 1 {
++		t.Fatalf("expected only the valid header, got %d: %v", len(h), h)
++	}
++	if got := h.Get("X-Evil"); got != "" {
++		t.Fatalf("CRLF injection produced a second header: %q", got)
++	}
++
++	warned := warnedHeaders(hook)
++	for _, name := range invalid {
++		if !warned[name] {
++			t.Fatalf("expected a WARN for dropped invalid header %q", name)
++		}
++	}
++}
++
++// TestHeadersFromLabels_ReservedDropped verifies every reserved header name is
++// dropped (case-insensitively) and a WARN is logged for each.
++func TestHeadersFromLabels_ReservedDropped(t *testing.T) {
++	// The canonical reserved names, plus mixed-case spellings to prove the match
++	// is case-insensitive.
++	names := []string{
++		"Range", "Accept-Encoding", "Accept", "Content-Type", "Content-Length",
++		"Authorization", "User-Agent", "Referer",
++		"AuThOrIzAtIoN", "USER-AGENT", "range",
++	}
++
++	for _, name := range names {
++		t.Run(name, func(t *testing.T) {
++			ctx, hook := ctxWithLogHook()
++			labels := map[string]string{
++				CustomHeaderLabelPrefix + name:           "should-be-dropped",
++				CustomHeaderLabelPrefix + "x-request-id": "kept",
++			}
++
++			h := HeadersFromLabels(ctx, labels)
++
++			if got := h.Get(name); got != "" {
++				t.Fatalf("reserved header %q reached the map: %q", name, got)
++			}
++			if got := h.Get("x-request-id"); got != "kept" {
++				t.Fatalf("non-reserved header dropped: %q", got)
++			}
++			if !warnedHeaders(hook)[name] {
++				t.Fatalf("expected a WARN for dropped reserved header %q", name)
++			}
++		})
++	}
++}
++
++// ctxWithLogHook returns a context carrying a private WARN-level logger and a
++// hook that captures its entries. It does not touch the process-global logger,
++// so tests stay isolated.
++func ctxWithLogHook() (context.Context, *logrustest.Hook) {
++	logger, hook := logrustest.NewNullLogger()
++	logger.SetLevel(logrus.WarnLevel)
++	return log.WithLogger(context.Background(), logrus.NewEntry(logger)), hook
++}
++
++// warnedHeaders returns the set of header names that were logged at WARN level.
++func warnedHeaders(hook *logrustest.Hook) map[string]bool {
++	warned := map[string]bool{}
++	for _, e := range hook.AllEntries() {
++		if e.Level != logrus.WarnLevel {
++			continue
++		}
++		if h, ok := e.Data["header"].(string); ok {
++			warned[h] = true
++		}
++	}
++	return warned
++}
+diff --git a/go.mod b/go.mod
+index 221aed41d..8ae1d3d90 100644
+--- a/go.mod
++++ b/go.mod
+@@ -33,6 +33,7 @@ require (
+ 	go.etcd.io/bbolt v1.5.0
+ 	go.uber.org/goleak v1.3.0
+ 	golang.org/x/crypto v0.54.0
++	golang.org/x/net v0.57.0
+ 	golang.org/x/sync v0.22.0
+ 	golang.org/x/sys v0.47.0
+ 	golang.org/x/time v0.15.0
+@@ -97,7 +98,6 @@ require (
+ 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
+ 	go.yaml.in/yaml/v2 v2.4.4 // indirect
+ 	go.yaml.in/yaml/v3 v3.0.4 // indirect
+-	golang.org/x/net v0.57.0 // indirect
+ 	golang.org/x/oauth2 v0.36.0 // indirect
+ 	golang.org/x/term v0.45.0 // indirect
+ 	golang.org/x/text v0.40.0 // indirect
+diff --git a/internal/http/auth.go b/internal/http/auth.go
+index 65e2b1754..79e2e85c6 100644
+--- a/internal/http/auth.go
++++ b/internal/http/auth.go
+@@ -145,6 +145,13 @@ func (ac *AuthClient) Do(req *http.Request) (*http.Response, error) {
+ 		for k := range ac.header {
+ 			req.Header.Set(k, ac.header.Get(k))
+ 		}
++		for k, vals := range CustomHeaders(ctx) {
++			name := http.CanonicalHeaderKey(k)
++			if _, reserved := ReservedHeaders[name]; reserved {
++				continue
++			}
++			req.Header[name] = append([]string(nil), vals...)
++		}
+ 		authReq, err := ac.handler.AuthorizeRequest(ctx, req)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("%w: %w", ErrFailedToAuthorizeRequest, err)
+diff --git a/internal/http/headers.go b/internal/http/headers.go
+index d04acc8b3..ededf207d 100644
+--- a/internal/http/headers.go
++++ b/internal/http/headers.go
+@@ -16,6 +16,11 @@
+ 
+ package http
+ 
++import (
++	"context"
++	"net/http"
++)
++
+ // These constants name the HTTP headers that the snapshotter or a shared library
+ // sets on its own requests. A caller must not override them through a custom
+ // header. ReservedHeaders lists them.
+@@ -29,3 +34,38 @@ const (
+ 	HeaderUserAgent      = "User-Agent"
+ 	HeaderReferer        = "Referer"
+ )
++
++// ReservedHeaders holds the reserved header names in canonical form for lookup.
++// A reserved name is set by the snapshotter itself, or by a library it shares the
++// client with. oras-go and the containerd docker fetcher set Accept and
++// Content-Type for content negotiation, so a custom header must not replace them.
++// HeadersFromLabels drops a custom header whose name is in this set, and
++// AuthClient.Do never lets one override it.
++var ReservedHeaders = map[string]struct{}{
++	http.CanonicalHeaderKey(HeaderRange):          {},
++	http.CanonicalHeaderKey(HeaderAcceptEncoding): {},
++	http.CanonicalHeaderKey(HeaderAccept):         {},
++	http.CanonicalHeaderKey(HeaderContentType):    {},
++	http.CanonicalHeaderKey(HeaderContentLength):  {},
++	http.CanonicalHeaderKey(HeaderAuthorization):  {},
++	http.CanonicalHeaderKey(HeaderUserAgent):      {},
++	http.CanonicalHeaderKey(HeaderReferer):        {},
++}
++
++// customHeadersKey is the context key for the custom request headers.
++type customHeadersKey struct{}
++
++// WithCustomHeaders returns a context that adds h to every request the AuthClient
++// sends under it.
++func WithCustomHeaders(ctx context.Context, h http.Header) context.Context {
++	if len(h) == 0 {
++		return ctx
++	}
++	return context.WithValue(ctx, customHeadersKey{}, h)
++}
++
++// CustomHeaders returns the headers set by WithCustomHeaders, or nil.
++func CustomHeaders(ctx context.Context) http.Header {
++	h, _ := ctx.Value(customHeadersKey{}).(http.Header)
++	return h
++}
+diff --git a/internal/http/headers_test.go b/internal/http/headers_test.go
+new file mode 100644
+index 000000000..bd0f0f731
+--- /dev/null
++++ b/internal/http/headers_test.go
+@@ -0,0 +1,155 @@
++/*
++   Copyright The Soci Snapshotter Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package http
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"sync"
++	"testing"
++)
++
++type captureRoundTripper struct{ got http.Header }
++
++func (c *captureRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
++	c.got = req.Header.Clone()
++	return &http.Response{StatusCode: http.StatusOK}, nil
++}
++
++// echoRoundTripper returns the x-request-id it saw in a response header. It is
++// safe to share across goroutines because it keeps no state.
++type echoRoundTripper struct{}
++
++func (echoRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
++	h := make(http.Header)
++	h.Set("x-seen-id", req.Header.Get("x-request-id"))
++	return &http.Response{StatusCode: http.StatusOK, Header: h}, nil
++}
++
++func TestCustomHeadersAttachedPerRequest(t *testing.T) {
++	global := http.Header{}
++	global.Set("User-Agent", "soci-test")
++	rt := &captureRoundTripper{}
++	ac := SimpleMockAuthClient(rt, global)
++
++	custom := http.Header{}
++	custom.Set("x-request-id", "caller-123")
++	custom.Set("x-custom-trace", "trace-1")
++	ctx := WithCustomHeaders(context.Background(), custom)
++
++	req, _ := http.NewRequestWithContext(ctx, "GET", "http://example/blob", nil)
++	if _, err := ac.Do(req); err != nil {
++		t.Fatal(err)
++	}
++	if got := rt.got.Get("x-request-id"); got != "caller-123" {
++		t.Fatalf("x-request-id not attached: got %q", got)
++	}
++	if got := rt.got.Get("x-custom-trace"); got != "trace-1" {
++		t.Fatalf("x-custom-trace not attached: got %q", got)
++	}
++	if got := rt.got.Get("User-Agent"); got != "soci-test" {
++		t.Fatalf("global header lost: got %q", got)
++	}
++}
++
++func TestCustomHeadersAbsent(t *testing.T) {
++	rt := &captureRoundTripper{}
++	ac := SimpleMockAuthClient(rt, http.Header{})
++	req, _ := http.NewRequestWithContext(context.Background(), "GET", "http://example/blob", nil)
++	if _, err := ac.Do(req); err != nil {
++		t.Fatal(err)
++	}
++	if got := rt.got.Get("x-request-id"); got != "" {
++		t.Fatalf("unexpected x-request-id: %q", got)
++	}
++}
++
++func TestCustomHeadersReservedDroppedAtSink(t *testing.T) {
++	rt := &captureRoundTripper{}
++	ac := SimpleMockAuthClient(rt, http.Header{})
++
++	custom := http.Header{}
++	custom.Set("x-request-id", "caller-123")
++	custom.Set(HeaderRange, "bytes=999-999") // reserved
++	custom.Set(HeaderAccept, "text/plain")   // reserved (set by oras-go)
++	ctx := WithCustomHeaders(context.Background(), custom)
++
++	req, _ := http.NewRequestWithContext(ctx, "GET", "http://example/blob", nil)
++	if _, err := ac.Do(req); err != nil {
++		t.Fatal(err)
++	}
++	if got := rt.got.Get("x-request-id"); got != "caller-123" {
++		t.Fatalf("non-reserved header lost: got %q", got)
++	}
++	if got := rt.got.Get(HeaderRange); got != "" {
++		t.Fatalf("reserved Range must be dropped at the sink: got %q", got)
++	}
++	if got := rt.got.Get(HeaderAccept); got != "" {
++		t.Fatalf("reserved Accept must be dropped at the sink: got %q", got)
++	}
++}
++
++func TestCustomHeadersMultiValue(t *testing.T) {
++	rt := &captureRoundTripper{}
++	ac := SimpleMockAuthClient(rt, http.Header{})
++
++	custom := http.Header{}
++	custom.Add("X-Trace", "a")
++	custom.Add("X-Trace", "b")
++	ctx := WithCustomHeaders(context.Background(), custom)
++
++	req, _ := http.NewRequestWithContext(ctx, "GET", "http://example/blob", nil)
++	if _, err := ac.Do(req); err != nil {
++		t.Fatal(err)
++	}
++	if got := rt.got.Values("X-Trace"); len(got) != 2 || got[0] != "a" || got[1] != "b" {
++		t.Fatalf("multi-value header not preserved: got %v", got)
++	}
++}
++
++func TestCustomHeadersConcurrentIsolation(t *testing.T) {
++	ac := SimpleMockAuthClient(echoRoundTripper{}, http.Header{})
++
++	const n = 50
++	var wg sync.WaitGroup
++	errs := make(chan error, n)
++	for i := 0; i < n; i++ {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			id := fmt.Sprintf("id-%d", i)
++			custom := http.Header{}
++			custom.Set("x-request-id", id)
++			ctx := WithCustomHeaders(context.Background(), custom)
++			req, _ := http.NewRequestWithContext(ctx, "GET", "http://example/blob", nil)
++			resp, err := ac.Do(req)
++			if err != nil {
++				errs <- fmt.Errorf("goroutine %d: %w", i, err)
++				return
++			}
++			if got := resp.Header.Get("x-seen-id"); got != id {
++				errs <- fmt.Errorf("goroutine %d saw request id %q, want %q", i, got, id)
++			}
++		}(i)
++	}
++	wg.Wait()
++	close(errs)
++	for err := range errs {
++		t.Fatal(err)
++	}
++}
