@@ -110,11 +110,8 @@ fn require_uninitialized(system: &impl System) -> Result<()> {
             source,
         }),
         Ok(value) => {
-            let bytes = value
-                .trim()
-                .parse::<u64>()
-                .ok()
-                .context(DiskSizeSnafu { value })?;
+            let value = value.trim();
+            let bytes = value.parse::<u64>().ok().context(DiskSizeSnafu { value })?;
             ensure!(bytes == 0, InitializedSnafu);
             Ok(())
         }
@@ -200,10 +197,17 @@ mod test {
 
     struct Fake {
         disk: Option<String>,
-        fail: Option<&'static str>,
+        fail: Option<Fail>,
         calls: RefCell<Vec<(String, Vec<String>)>>,
     }
-    const BUSY: &str = "EBUSY";
+    /// Which System call the fake fails.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Fail {
+        /// Writes fail with EBUSY.
+        Write,
+        /// Running this program fails.
+        Command(&'static str),
+    }
     impl System for Fake {
         fn read(&self, path: &'static str) -> io::Result<String> {
             if path == MEMINFO {
@@ -217,7 +221,7 @@ mod test {
             self.calls
                 .borrow_mut()
                 .push((format!("write {path}"), vec![value.into()]));
-            if self.fail == Some(BUSY) {
+            if self.fail == Some(Fail::Write) {
                 return Err(io::Error::from_raw_os_error(16));
             }
             Ok(())
@@ -226,7 +230,7 @@ mod test {
             self.calls
                 .borrow_mut()
                 .push((program.into(), args.iter().map(|s| s.to_string()).collect()));
-            if self.fail == Some(program) {
+            if matches!(self.fail, Some(Fail::Command(failing)) if failing == program) {
                 return Err(Error::CommandFailed {
                     program: program.into(),
                     output: "test failure".into(),
@@ -235,7 +239,7 @@ mod test {
             Ok(())
         }
     }
-    fn fake(disk: Option<&str>, fail: Option<&'static str>) -> Fake {
+    fn fake(disk: Option<&str>, fail: Option<Fail>) -> Fake {
         Fake {
             disk: disk.map(str::to_owned),
             fail,
@@ -283,7 +287,7 @@ mod test {
                 ),
             ]
         );
-        let host = fake(None, Some("/usr/sbin/mkswap"));
+        let host = fake(None, Some(Fail::Command("/usr/sbin/mkswap")));
         assert!(prepare_with(&host, None).is_err());
         assert_eq!(host.calls.borrow().len(), 3);
     }
@@ -292,7 +296,7 @@ mod test {
     fn device_initialized_after_the_check_is_left_alone() {
         // Another initializer wins the race between the check and the write; the kernel
         // refuses the new size, and nothing formats or enables the device.
-        let host = fake(None, Some(BUSY));
+        let host = fake(None, Some(Fail::Write));
         assert!(prepare_with(&host, None).is_err());
         let calls = host.calls.borrow();
         assert_eq!(calls.len(), 2);
