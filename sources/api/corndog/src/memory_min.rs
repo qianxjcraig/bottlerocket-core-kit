@@ -1,10 +1,11 @@
 //! Apply settings-rendered memory.min drop-ins without restarting services.
 use bottlerocket_modeled_types::KubeReservedMemoryMinValue;
-use log::info;
+use log::{info, warn};
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
 use std::{env, fs, io, process::Command};
 
-// Read settings-rendered values, not systemctl set-property's runtime overrides.
+// Load rendered values before systemctl set-property's 50-MemoryMin.conf.
+// Otherwise daemon-reload can replace the zero fallback with configured floors.
 const RUNTIME: &str = "/etc/systemd/system/runtime.slice.d/10-memory-min.conf";
 const KUBELET: &str = "/etc/systemd/system/kubelet.service.d/10-memory-min.conf";
 const CONTAINERD: &str = "/etc/systemd/system/containerd.service.d/10-memory-min.conf";
@@ -89,14 +90,9 @@ fn parse(text: &str, path: &'static str, section: &str) -> Result<u64> {
     Ok(bytes)
 }
 
-fn apply_with(system: &impl System, settings_changed: bool) -> Result<()> {
-    // At boot, systemd applies the rendered drop-ins when the units start.
-    // Only settings changes need to update the running units.
-    if !settings_changed {
-        return Ok(());
-    }
-
-    let mut values = [0; 3];
+fn apply_with(system: &impl System, boot: bool) -> Result<()> {
+    let mut values = [None; 3];
+    let mut missing = Vec::new();
     for (i, (path, section)) in [
         (RUNTIME, "[Slice]"),
         (KUBELET, "[Service]"),
@@ -105,10 +101,27 @@ fn apply_with(system: &impl System, settings_changed: bool) -> Result<()> {
     .into_iter()
     .enumerate()
     {
-        let text = system.read(path).context(ReadSnafu { path })?;
-        values[i] = parse(&text, path, section)?;
+        match system.read(path) {
+            Ok(text) => values[i] = Some(parse(&text, path, section)?),
+            Err(error) if boot && error.kind() == io::ErrorKind::NotFound => {
+                missing.push(path);
+            }
+            Err(source) => return Err(Error::Read { path, source }),
+        }
     }
-    let [parent, kubelet, containerd] = values;
+    // Every file is parsed before clearing, so a missing file can't hide invalid content.
+    if !missing.is_empty() {
+        for path in missing {
+            warn!("Missing rendered memory.min file {path}; clearing service and parent memory.min during boot");
+        }
+        for unit in ["kubelet.service", "containerd.service", "runtime.slice"] {
+            system.set_min(unit, 0)?;
+        }
+        return Ok(());
+    }
+    let [Some(parent), Some(kubelet), Some(containerd)] = values else {
+        unreachable!("all files read and parsed");
+    };
     ensure!(
         kubelet
             .saturating_add(containerd)
@@ -130,8 +143,9 @@ fn apply_with(system: &impl System, settings_changed: bool) -> Result<()> {
 }
 
 pub fn apply() -> Result<()> {
-    // CHANGED_SETTINGS is set only by API-triggered runs; --all omits it.
-    apply_with(&Host, env::var_os("CHANGED_SETTINGS").is_some())
+    // CHANGED_SETTINGS is absent for full applications, including runtime --all.
+    // Both keyed and full applications must update the runtime properties.
+    apply_with(&Host, env::var_os("CHANGED_SETTINGS").is_none())
 }
 
 #[cfg(test)]
@@ -185,7 +199,6 @@ mod tests {
     struct Fake {
         files: HashMap<&'static str, String>,
         errors: HashMap<&'static str, io::ErrorKind>,
-        reads: RefCell<Vec<&'static str>>,
         writes: RefCell<Vec<(&'static str, u64)>>,
         fail_at: Option<usize>,
     }
@@ -206,7 +219,6 @@ mod tests {
                     (CONTAINERD, format!("[Service]\nMemoryMin={containerd}\n")),
                 ]),
                 errors: HashMap::new(),
-                reads: RefCell::new(vec![]),
                 writes: RefCell::new(vec![]),
                 fail_at: None,
             }
@@ -214,7 +226,6 @@ mod tests {
     }
     impl System for Fake {
         fn read(&self, path: &'static str) -> io::Result<String> {
-            self.reads.borrow_mut().push(path);
             if let Some(kind) = self.errors.get(path) {
                 return Err(io::Error::from(*kind));
             }
@@ -241,66 +252,68 @@ mod tests {
     #[test_case(200 << 20, 300 << 20; "different")]
     #[test_case(KubeReservedMemoryMinValue::MAX_BYTES, 1; "capped parent")]
     fn sets_parent_then_children_without_reading_systemd(a: u64, b: u64) {
-        let fake = Fake::new(a, b);
-        apply_with(&fake, true).unwrap();
-        assert_eq!(
-            *fake.writes.borrow(),
-            [
-                (
-                    "runtime.slice",
-                    a.saturating_add(b)
-                        .min(KubeReservedMemoryMinValue::MAX_BYTES)
-                ),
-                ("kubelet.service", a),
-                ("containerd.service", b)
-            ]
-        );
+        for full_apply in [false, true] {
+            let fake = Fake::new(a, b);
+            apply_with(&fake, full_apply).unwrap();
+            assert_eq!(
+                *fake.writes.borrow(),
+                [
+                    (
+                        "runtime.slice",
+                        a.saturating_add(b)
+                            .min(KubeReservedMemoryMinValue::MAX_BYTES)
+                    ),
+                    ("kubelet.service", a),
+                    ("containerd.service", b)
+                ]
+            );
+        }
     }
 
     #[test_case(RUNTIME; "runtime")]
     #[test_case(KUBELET; "kubelet")]
     #[test_case(CONTAINERD; "containerd")]
-    fn missing_file_is_fatal_on_live_update(path: &'static str) {
+    fn missing_file_clears_children_then_parent_only_at_boot(path: &'static str) {
         let mut fake = Fake::new(128, 128);
         fake.files.remove(path);
-        assert!(matches!(
-            apply_with(&fake, true),
-            Err(Error::Read { path: error_path, source })
-                if error_path == path && source.kind() == io::ErrorKind::NotFound
-        ));
+        apply_with(&fake, true).unwrap();
+        assert_eq!(
+            *fake.writes.borrow(),
+            [
+                ("kubelet.service", 0),
+                ("containerd.service", 0),
+                ("runtime.slice", 0)
+            ]
+        );
+        fake.writes.borrow_mut().clear();
+        assert!(matches!(apply_with(&fake, false), Err(Error::Read { .. })));
         assert!(fake.writes.borrow().is_empty());
     }
 
-    #[test]
-    fn boot_skips_reading_and_applying_drop_ins() {
-        let mut fake = Fake::new(128, 128);
-        // Missing, unreadable, or invalid files are left to systemd at boot.
-        fake.files.remove(RUNTIME);
-        fake.errors.insert(KUBELET, io::ErrorKind::PermissionDenied);
-        fake.files.insert(CONTAINERD, "invalid".into());
-        apply_with(&fake, false).unwrap();
-        assert!(fake.reads.borrow().is_empty());
-        assert!(fake.writes.borrow().is_empty());
-    }
-
-    #[test_matrix([
-        "",
-        "[Service]\n",
-        "[Service]\nMemoryMin=-1Mi",
-        "[Service]\nMemoryMin=1..2Mi",
-        "[Service]\nMemoryMin=1.5Gi",
-        "[Service]\nMemoryMin=01Mi",
-        "[Service]\nMemoryMin=16Ei",
-        "[Service]\nMemoryMin=1G",
-        "[Service]\nMemoryMin=1\nMemoryMin=2",
-        "[Service]\nMemoryMin=1\n[Service]",
-        "[Slice]\nMemoryMin=1",
-        "[Service]\nMemoryMin=1\nExecStart=/bin/false"
-    ])]
-    fn invalid_content_is_fatal_before_live_writes(text: &str) {
+    #[test_matrix(
+        [
+            "",
+            "[Service]\n",
+            "[Service]\nMemoryMin=-1Mi",
+            "[Service]\nMemoryMin=1..2Mi",
+            "[Service]\nMemoryMin=1.5Gi",
+            "[Service]\nMemoryMin=01Mi",
+            "[Service]\nMemoryMin=16Ei",
+            "[Service]\nMemoryMin=1G",
+            "[Service]\nMemoryMin=1\nMemoryMin=2",
+            "[Service]\nMemoryMin=1\n[Service]",
+            "[Slice]\nMemoryMin=1",
+            "[Service]\nMemoryMin=1\nExecStart=/bin/false"
+        ],
+        [false, true]
+    )]
+    fn invalid_content_remains_fatal_even_if_another_file_is_missing(text: &str, boot: bool) {
         let mut fake = Fake::new(128, 128);
         fake.files.insert(CONTAINERD, text.into());
-        assert!(apply_with(&fake, true).is_err());
+        if boot {
+            fake.files.remove(RUNTIME);
+        }
+        assert!(apply_with(&fake, boot).is_err());
         assert!(fake.writes.borrow().is_empty());
     }
 
@@ -321,13 +334,22 @@ mod tests {
         let mut fake = Fake::new(128, 128);
         fake.files
             .insert(RUNTIME, format!("[Slice]\nMemoryMin={value}"));
-        assert!(matches!(apply_with(&fake, true), Err(Error::ParentSum)));
+        assert!(matches!(apply_with(&fake, false), Err(Error::ParentSum)));
         assert!(fake.writes.borrow().is_empty());
     }
 
-    #[test_matrix(1..=3)]
-    fn each_set_property_failure_is_fatal_with_no_later_writes(step: usize) {
+    #[test_matrix([false, true], 1..=3)]
+    fn each_set_property_failure_is_fatal_with_no_later_writes(boot: bool, step: usize) {
         let mut fake = Fake::new(200, 300);
+        fake.fail_at = Some(step);
+        assert!(apply_with(&fake, boot).is_err());
+        assert_eq!(fake.writes.borrow().len(), step);
+    }
+
+    #[test_matrix([RUNTIME, KUBELET, CONTAINERD], 1..=3)]
+    fn clearing_failure_is_fatal_with_no_later_writes(path: &'static str, step: usize) {
+        let mut fake = Fake::new(200, 300);
+        fake.files.remove(path);
         fake.fail_at = Some(step);
         assert!(apply_with(&fake, true).is_err());
         assert_eq!(fake.writes.borrow().len(), step);
